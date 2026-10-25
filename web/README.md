@@ -38,6 +38,31 @@ The green background means the handshake succeeded. The server log shows the bro
 Use `multiThreadedJit`. It needs COOP/COEP headers (`server.mjs` sets them). CPU speed is roughly 250–900 emulated
 MIPS. Boxedwine's own notes put MW3 (2011) at about 9 fps in the browser, so a 2008 2D/isometric client should fit.
 
+## Real client (2026-10-25): title screen reached
+
+The real `yo2.exe` Ver.080912 (its `merge.dat` matches `extraer_juego.py`'s SHA-256) ran in the same browser setup:
+
+- The updater fetched `/yo2/root.txt` and `/yo2/merge.txt` from `run.py`'s HTTP port 8730 through the gateway.
+- It showed the KONAMI logo, then the full **title menu rendered through D3D8 → WebGL**. Mouse hover worked.
+- Clicking ONLINE didn't register yet. The client probably reads mouse buttons via DirectInput (`dinput8`), which may
+  miss short synthetic clicks. This is the next thing to solve.
+- The menu came up in German. The language setting still needs to be set the way the launcher does it.
+
+Things that had to change:
+
+- **The hook DLL needs the registry override.** `WINEDLLOVERRIDES=version=n,b` from the environment was ignored, and
+  Wine kept loading builtin `version.dll`. `regedit /S` with `[HKEY_CURRENT_USER\Software\Wine\DllOverrides]
+  "version"="native,builtin"` worked. Build the DLL with `build_dll.ps1`'s flags (`-nostdlib -ffreestanding
+  -Wl,--entry,_DllMain@12 ... -lkernel32 -luser32 -lgdi32`).
+- **Launch** through a `.bat`: `regedit /S yo2.reg`, `set YO2ONLINE_NET=1`, `yo2.exe`.
+- **Sound on crashed the emulator** right after the client opened audio: `kpanic("Failed to queue SDL callback")`,
+  meaning the main thread's SDL event queue was full. `sound=false` avoids it.
+
+> ⚠️ **Memory.** Never pass the game as a single `app` zip with `storage=memory`. Boxedwine downloads the whole
+> 1.1 GB zip into the page and copies it into its in-memory filesystem, so it takes several GB of RAM per load, and
+> repeated reloads exhausted the test Mac's memory. Before testing again, serve the game lazily: Boxedwine's host-folder mount,
+> or a fetch-on-read overlay. Leave out `Sound.dat` (416 MB) while sound is off.
+
 ## How to reproduce
 
 ```sh
