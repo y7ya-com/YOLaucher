@@ -60,8 +60,35 @@ Things that had to change:
 
 > ⚠️ **Memory.** Never pass the game as a single `app` zip with `storage=memory`. Boxedwine downloads the whole
 > 1.1 GB zip into the page and copies it into its in-memory filesystem, so it takes several GB of RAM per load, and
-> repeated reloads exhausted the test Mac's memory. Before testing again, serve the game lazily: Boxedwine's host-folder mount,
-> or a fetch-on-read overlay. Leave out `Sound.dat` (416 MB) while sound is off.
+> repeated reloads exhausted the test Mac's memory.
+
+### Lazy loading (solved)
+
+[`lazydrive.js`](lazydrive.js) + [`boxedwine-lazy.patch`](boxedwine-lazy.patch) (also add
+`<script src=lazydrive.js></script>` after `fsfs.js` in `boxedwine.html`):
+
+- `?app=yo2&lazyapp=1` makes `yo2.zip` (store-only, no `Sound.dat`, 716 MB) a **range-read file**. Boxedwine reads only
+  the zip's index at mount, then seeks per file. It reads 1 MB HTTP ranges through a 64-chunk (64 MB) LRU cache, and
+  writes go to an in-memory overlay. Mounting took 4 MB of downloads; reaching the title menu took 38 MB.
+- `server.mjs` needs single-range `Range:` support (in the patch).
+- Don't put the game on `D:` (`?lazy=` manifest mode). `CreateDirectoryA("profiles")` fails there, and the updater
+  stops after `root.txt`. The zip on `C:\files` gets Boxedwine's writable overlay.
+
+### Blocker: GPU memory leak at the title screen
+
+With lazy loading, the page itself stayed around 3 GB. But while the title menu was on screen, the browser's **GPU
+process grew about 70 MB/s, to 6.7 GB**, and the system went from 56% to 33% free memory in about a minute. The
+pane had to be closed. The plain D3D8 probe didn't leak, so it's something the client does every frame (texture locks
+or uploads, or dynamic vertex buffers) that the WebGL WineD3D path doesn't free.
+
+Next steps, with a kill switch in the page (auto-stop after N seconds or N WebGL objects):
+
+1. Count `gl.create*`/`delete*` per frame to find which resource leaks.
+2. Try the single-threaded build and a standalone Chrome, to separate a Boxedwine bug from an embedded-browser one.
+3. Fix it in Boxedwine's `tools/d3dToWebGL` series or report it upstream.
+
+Clicks still don't register. Focusing the canvas didn't help, and `document.hasFocus()` stays false in the embedded
+pane. A standalone browser window would answer whether it's a focus problem.
 
 ## How to reproduce
 

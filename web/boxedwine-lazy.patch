@@ -1,0 +1,59 @@
+--- boxedwine-shell.js	2026-10-25 15:55:35
++++ boxedwine-shell.js	2026-10-25 16:37:02
+@@ -785,6 +785,13 @@
+             	let uint8Array = getBase64Data(Config.appPayload);
+             	createFile("/", Config.payloadZipFile, uint8Array);
+                 callback();
++            }else if(Config.appZipFile.length > 0 && getParameter("lazyapp")){
++                // lazy: Boxedwine only reads the zip's index at mount, then seeks per file, so range reads suffice
++                fetch(Config.locateAppBaseUrl + Config.appZipFile, {method: "HEAD"}).then(function (r) {
++                    createLazyFile("/", Config.appZipFile, Config.locateAppBaseUrl + Config.appZipFile, Number(r.headers.get("Content-Length")));
++                    console.log("lazy app zip: " + Config.appZipFile);
++                    callback();
++                });
+             }else if(Config.appZipFile.length > 0){
+             	loadFile(Config.locateAppBaseUrl, Config.appZipFile, (uint8Array) => {
+             		if (Config.Program.length > 0) {            	
+@@ -1022,6 +1029,12 @@
+             }
+         }
+         function initBrowserFilesystem(callback) {
++            var lazyManifest = getParameter("lazy");
++            if (lazyManifest && !callback.lazy) {
++                var next = function () { setupLazyDrive(decodeUrlValue(lazyManifest), Config.d_drive).then(callback); };
++                next.lazy = true;
++                return initBrowserFilesystem(next);
++            }
+     		console.log("Use Storage mode: "+Config.storageMode);
+             console.log("Use Root FS storage mode: "+Config.rootStorageMode);
+             FS.mkdirTree(ROOT);
+diff --git a/project/emscripten/server.mjs b/project/emscripten/server.mjs
+index 02f8527..627b247 100644
+--- a/project/emscripten/server.mjs
++++ b/project/emscripten/server.mjs
+@@ -103,7 +103,25 @@ const server = createServer(async (request, response) => {
+         response.end("Not found");
+         return;
+     }
++    // ponytail: single-range only (what the lazy drive sends)
++    const range = /^bytes=(\d+)-(\d*)$/.exec(request.headers.range || "");
++    if (range) {
++        const size = finalFile.info.size;
++        const start = Number(range[1]);
++        const end = Math.min(range[2] ? Number(range[2]) : size - 1, size - 1);
++        response.writeHead(206, {
++            "Content-Length": end - start + 1,
++            "Content-Range": `bytes ${start}-${end}/${size}`,
++            "Content-Type": "application/octet-stream",
++            "Cross-Origin-Embedder-Policy": "require-corp",
++            "Cross-Origin-Opener-Policy": "same-origin",
++            "Cross-Origin-Resource-Policy": "same-origin",
++        });
++        createReadStream(finalFile.path, { start, end }).pipe(response);
++        return;
++    }
+     response.writeHead(200, {
++        "Accept-Ranges": "bytes",
+         "Content-Length": finalFile.info.size,
+         "Content-Type": mimeTypes.get(extname(finalFile.path)) || "application/octet-stream",
+         "Cross-Origin-Embedder-Policy": "require-corp",
