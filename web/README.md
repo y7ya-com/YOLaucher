@@ -145,13 +145,32 @@ every frame (3 MB at 1024x768) stayed in the GPU process, even when the page clo
   frames (debug tracing, a second emulator on the machine) make clicks look random. Hold a click for two frames.
 - Wine's fullscreen pointer grab sends events through its hwnd-less clip window; harmless, but
   `[HKCU\Software\Wine\X11 Driver] "GrabFullscreen"="N"` / `"GrabPointer"="N"` keep events on the game window.
+- **You walk by holding the RIGHT mouse button** (not by clicking the floor). `CChibiAvatarCtrl` (0x9c5560) reads
+  the right-button "held" slot of `CMyMouseEx` (vtable 0xbe9714, +8), so the avatar walks toward the cursor while
+  the right button is down. Left click is for UI, NPCs and other players. In My Room, walk onto the red door; the
+  gate then lists languages and rooms. The SWF door button (`go_legacy_auto_btn`) is dead in 080912.
+- **Doors and the shop are map exits, not buttons.** Each map's exit table is in the exe at 0xd2d4d0 (0x1a4 bytes
+  per map, `FUN_00a4fe00`; exits at +0x104, 16 bytes each, first int = target). Target 0-9 is another map, 11 is the
+  shop scene (scene 14, `CShopScene`; `FUN_009fb8c0` on `CTmAvatarOnExit`). `Map_a02` (Store) exit 2 and `Map_d02`
+  exit 2 are the shops: walk onto the mat in front of the CARD SHOP doors under the stairs.
 
 ### Status (2026-10-26)
 
-Title → rules → login (account seeded with `make_state.py`) → character select → **My Room** (lobby server
-connected) → Main Menu → **Edit Deck** with the trunk all work in the browser. Not yet: leaving My Room. Every map
-object (doors, TV, shelf, floor) ignores clicks although the game receives correct `WM_LBUTTON*` messages; shop and
-NPC duel are behind that. The deck editor runs at ~1 fps (the game thread waits on main-thread file I/O proxies).
+Title → login (account seeded with `make_state.py`) → character select → **My Room** → Edit Deck → walk out →
+gate (English, Beginner's Lobby A) → **lobby rooms** (MOVE between Duel Academy / Store / Duel Space / Slifer Red)
+→ **NPC dialogs** → **NPC duel** all work in the browser. The duel against A-lien (Store) goes through
+rock-paper-scissors, the field, summoning from the hand, phases and the NPC's turns (server `0x6xxx` on port 5760,
+OCGcore on the emulator).
+
+- Entering a lobby room failed with `err:d3d:resource_init Out of adapter memory` (WineD3D's default VRAM estimate
+  for WebGL is small). `[HKCU\Software\Wine\Direct3D] "VideoMemorySize"="1024"` fixes it.
+- `YO2ONLINE_SKIPINTRO=2` (hook) skips the logo and the rules page; ONLINE then opens the login dialog.
+- Speed: lobby rooms ~4 fps, duel field similar, deck editor ~1 fps (the game thread waits on main-thread file I/O
+  proxies). Playable but slow; the speed patches in this folder are the next lever.
+- Not yet verified in the browser: buying in the shop (the exit is found, see Input).
+- Testing headless: Chrome for Testing with `--headless=new` keeps ANGLE Metal on Apple GPUs and runs at the same
+  frame rate as a visible window (a hidden headed window drops to ~1 fps). Drive it over CDP with trusted
+  `Input.dispatchMouseEvent`, holding each button for two presented frames.
 
 ## How to reproduce
 
