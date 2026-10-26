@@ -157,6 +157,18 @@ every frame (3 MB at 1024x768) stayed in the GPU process, even when the page clo
   shop scene (scene 14, `CShopScene`; `FUN_009fb8c0` on `CTmAvatarOnExit`). `Map_a02` (Store) exit 2 and `Map_d02`
   exit 2 are the shops: walk onto the mat in front of the CARD SHOP doors under the stairs.
 
+### Game patches
+
+Applied in memory by the hook DLL (`yo2net.c`) at startup. Each checks the original bytes first and skips on a
+mismatch; `yo2.exe` on disk is never changed. Each is off unless its switch is set.
+
+| Switch | Address | Original → new | Why |
+|---|---|---|---|
+| `YO2ONLINE_WINDOW_FORCEFS=1` | 0x608188 | `ff 52 30` (`call [edx+0x30]`, reads the setting) → `b0 01 90` (`mov al,1`) | game uses its Full-screen path: 1024x768 client, clicks land (see Input) |
+| `YO2ONLINE_TEXLOADERS=8` | 0x59c8ed, 0x59f3a0 | `81 fe 80 00 00 00` / `81 fa 80 00 00 00` → limit byte `80` → `08` | 8 texture-loader threads instead of 128 (each is a Web Worker) |
+| `YO2ONLINE_SKIPINTRO=1` | 0x6deebd | `6a 02` → `6a 04` | patcher asks for the title instead of the KONAMI logo |
+| `YO2ONLINE_SKIPINTRO=2` | also 0x7fa659 | `6a 05` → `6a 06` | ONLINE opens login directly, skipping the rules page |
+
 ### Status (2026-10-26)
 
 Title → login (account seeded with `make_state.py`) → character select → **My Room** → Edit Deck → walk out →
