@@ -44,8 +44,8 @@ The real `yo2.exe` Ver.080912 (its `merge.dat` matches `extraer_juego.py`'s SHA-
 
 - The updater fetched `/yo2/root.txt` and `/yo2/merge.txt` from `run.py`'s HTTP port 8730 through the gateway.
 - It showed the KONAMI logo, then the full **title menu rendered through D3D8 → WebGL**. Mouse hover worked.
-- Clicking ONLINE didn't register yet. The client probably reads mouse buttons via DirectInput (`dinput8`), which may
-  miss short synthetic clicks. This is the next thing to solve.
+- Clicks: solved 2026-10-26, see "Input" below. The client reads the mouse from window messages and
+  `GetAsyncKeyState`; DirectInput is only used for the keyboard.
 - The menu came up in German. Solved (2026-10-26): the language is `language = N` in `system.bin` (0 japanese,
   1 english, 2 german, 3 french, 4 italian, 5 spanish, 6 korean), and the stock 2008 file ships `2`. YOLaucher's
   launcher never touches it; players switched it in the client's Options dialog, which rewrites the file.
@@ -106,21 +106,52 @@ so wineboot doesn't install Mono or Gecko.
 - Don't put the game on `D:` (`?lazy=` manifest mode). `CreateDirectoryA("profiles")` fails there, and the updater
   stops after `root.txt`. The zip on `C:\files` gets Boxedwine's writable overlay.
 
-### Blocker: GPU memory leak at the title screen
+### GPU memory leak at the title screen (fixed)
 
-With lazy loading, the page itself stayed around 3 GB. But while the title menu was on screen, the browser's **GPU
-process grew about 70 MB/s, to 6.7 GB**, and the system went from 56% to 33% free memory in about a minute. The
-pane had to be closed. The plain D3D8 probe didn't leak, so it's something the client does every frame (texture locks
-or uploads, or dynamic vertex buffers) that the WebGL WineD3D path doesn't free.
+While the title menu was on screen the browser's GPU process grew about 70 MB/s. Counting WebGL calls per frame
+showed no leaking WebGL object (9 textures, 1 buffer, flat). The leak was the present path: every frame Boxedwine's GL
+pthread called `OffscreenCanvas.transferToImageBitmap()` and posted the bitmap to the page. Chrome frees a transferred
+WebGL bitmap's GPU buffer with a task on the *producing* thread, and that pthread never returns to its event loop, so
+every frame (3 MB at 1024x768) stayed in the GPU process, even when the page closed the bitmap at once.
+[`boxedwine-yo2.patch`](boxedwine-yo2.patch) presents with `readPixels` into a transferable buffer instead
+(`sdlgl.cpp` + a `boxedwinePresentPixels` page handler). The GPU process now stays at 300–400 MB.
 
-Next steps, with a kill switch in the page (auto-stop after N seconds or N WebGL objects):
+### Speed fixes
 
-1. Count `gl.create*`/`delete*` per frame to find which resource leaks.
-2. Try the single-threaded build and a standalone Chrome, to separate a Boxedwine bug from an embedded-browser one.
-3. Fix it in Boxedwine's `tools/d3dToWebGL` series or report it upstream.
+- **Dialog screens ran at 3 fps.** WineD3D streams vertices into one 16 MB WebGL buffer with a tiny `bufferSubData`
+  per draw (~200 per frame on the login screen). On ANGLE's Metal backend each such update to a buffer the GPU is
+  still using costs about 1 ms of GPU time (in a stand-alone benchmark: 16 MB buffer × 216 updates = 252 ms/frame,
+  256 KB buffer = 6 ms). The patch's `boxedwine-webgl-streaming.js` (`--pre-js`) routes small updates of buffers
+  ≥ 1 MB through a 64 KB staging buffer and `copyBufferSubData`: 17 ms in the benchmark, login dialog 3 → 17 fps.
+- **128 texture-loader threads.** `CD3DTextureManager` (0x59c6d0) starts 0x80 threads that poll their slot with
+  `Sleep(1)`. Every guest thread is a Web Worker here (~175 live threads). The hook DLL's `YO2ONLINE_TEXLOADERS=8`
+  lowers the limit in the two loops that use it (0x59c8ed creates mutex + thread per slot, 0x59f3a0 picks a free slot):
+  55 threads, page 1.9 → 1.4 GB.
+- **Use the non-JIT build** (`make multiThreaded`). `multiThreadedJit` reached 3.6 GB in the page within ~40 s of
+  boot (heap 1.3 GB, the rest compiled JIT modules and worker isolates), too much next to a normal desktop session.
+  Non-JIT: title ~36 fps, room ~30 fps, dialogs ~17 fps; it's CPU-bound in the interpreter (x87 softfloat is hot).
 
-Clicks still don't register. Focusing the canvas didn't help, and `document.hasFocus()` stays false in the embedded
-pane. A standalone browser window would answer whether it's a focus problem.
+### Input
+
+- In the app's embedded pane clicks didn't arrive at all; in a normal Chrome window (or Chrome driven over CDP)
+  mouse and keyboard events reach the game.
+- **Small buttons missed.** Boxedwine's screen is 1024x768, so the game's framed 1024x768 window doesn't fit and its
+  client area shrinks to 1018x736. The game lays out for 1024x768 and its `CMouseLayer` doesn't scale, so clicks
+  drift up to ~30 px toward the bottom right. `YO2ONLINE_WINDOW_FORCEFS=1` (hook DLL; now honoured on its own) makes
+  the game use its Full-screen path: client exactly 1024x768, every button lands. `fullscreen = 1` in `system.bin`
+  hangs the client before it draws; `resolution=1030x800` breaks D3D device creation (no 1024x768 mode); YOLaucher's
+  `YO2ONLINE_WINDOW=fit` is off by 1.5x (Wine reports a DPI-scaled monitor).
+- **The game samples the button once per frame.** A press and release that land in the same frame are lost, so slow
+  frames (debug tracing, a second emulator on the machine) make clicks look random. Hold a click for two frames.
+- Wine's fullscreen pointer grab sends events through its hwnd-less clip window; harmless, but
+  `[HKCU\Software\Wine\X11 Driver] "GrabFullscreen"="N"` / `"GrabPointer"="N"` keep events on the game window.
+
+### Status (2026-10-26)
+
+Title → rules → login (account seeded with `make_state.py`) → character select → **My Room** (lobby server
+connected) → Main Menu → **Edit Deck** with the trunk all work in the browser. Not yet: leaving My Room. Every map
+object (doors, TV, shelf, floor) ignores clicks although the game receives correct `WM_LBUTTON*` messages; shop and
+NPC duel are behind that. The deck editor runs at ~1 fps (the game thread waits on main-thread file I/O proxies).
 
 ## How to reproduce
 

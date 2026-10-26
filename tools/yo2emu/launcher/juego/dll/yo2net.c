@@ -10,6 +10,7 @@
  *   YO2_AVISO_SALA=1/0       el mismo interruptor que aviso_sala_hook.js (o el fichero yo2-aviso-sala.txt)
  *   YO2ONLINE_WINDOW=orig|1.5|2|fit  ventana ampliada (rx/PAN, 24-10; ver "ventana ampliada" mas abajo). Vacio u "orig" =
  *                            el juego tal cual. Funciona sola (sin YO2ONLINE_NET) y no hace falta nada mas.
+ *   YO2ONLINE_TEXLOADERS=<n> solo navegador (Boxedwine): n hilos de carga de texturas en vez de 128 (ver cargadores_instalar)
  *   YO2ONLINE_SKIPINTRO=1|2  pruebas: 1 = sin logo KONAMI, 2 = ademas sin la pantalla de normas (ver saltar_intro)
  *
  * Por que version.dll: yo2.exe la importa (GetFileVersionInfoA/SizeA, VerQueryValueA), no es una KnownDLL (Windows la
@@ -838,7 +839,7 @@ static void *WINAPI h_d3dcreate8(UINT ver) {
     return p;
 }
 
-/* Solo pruebas: YO2ONLINE_WINDOW_FORCEFS=1 hace que el juego crea que esta en «Full screen» (DAT_0126d420 = 1) aunque
+/* YO2ONLINE_WINDOW_FORCEFS=1 hace que el juego crea que esta en «Full screen» (DAT_0126d420 = 1) aunque
  * system.bin diga ventana, para probar el camino de pantalla completa sin tocar system.bin: la llamada que lee el ajuste
  * (call [edx+0x30], 3 bytes en 0x608188) pasa a «mov al,1 / nop». */
 static NOINL void forzar_pantalla_completa(void) {
@@ -853,6 +854,35 @@ static NOINL void forzar_pantalla_completa(void) {
     VirtualProtect(p, 3, viejo, &viejo);
     FlushInstructionCache(GetCurrentProcess(), p, 3);
     log1("[ventana] FORCEFS: el juego cree que esta en pantalla completa", "");
+}
+
+/* YO2ONLINE_TEXLOADERS=N (1-127; vacio o 0 = las 128 de siempre): CD3DTextureManager (0x59c6d0) crea 128 hilos de carga
+ * de texturas, cada uno en un bucle Sleep(1) mirando su hueco (0x59f2f0). En Windows no cuesta nada; en el navegador
+ * (Boxedwine) cada hilo es un Web Worker y los 128 se comen memoria y CPU. Se cambia el limite 0x80 en los dos bucles que
+ * lo usan: el que crea mutex + hilo por hueco (cmp esi,0x80 en 0x59c8ed) y el que busca un hueco libre (cmp edx,0x80 en
+ * 0x59f3a0), asi solo se reparten los huecos 0..N-1, que son los que tienen hilo. El otro bucle de 128 (0x59cad0) espera el
+ * mutex de cada hueco: los que no se crearon son NULL y la espera vuelve al momento. */
+static NOINL void cargadores_instalar(void) {
+    static const BYTE esperado[2][6] = {{0x81, 0xfe, 0x80, 0x00, 0x00, 0x00}, {0x81, 0xfa, 0x80, 0x00, 0x00, 0x00}};
+    BYTE *p[2];
+    unsigned n = leer_uint_env("YO2ONLINE_TEXLOADERS");
+    DWORD viejo;
+    int i, j;
+    Linea l;
+    if (n == 0 || n >= 0x80) return;
+    p[0] = A(0x0059c8ed);
+    p[1] = A(0x0059f3a0);
+    for (i = 0; i < 2; i++) {
+        if (!legible(p[i], 6)) return;
+        for (j = 0; j < 6; j++) if (p[i][j] != esperado[i][j]) { log1("[texturas] bytes inesperados; no se toca", ""); return; }
+    }
+    for (i = 0; i < 2; i++) {
+        if (!VirtualProtect(p[i] + 2, 1, PAGE_EXECUTE_READWRITE, &viejo)) return;
+        p[i][2] = (BYTE)n;
+        VirtualProtect(p[i] + 2, 1, viejo, &viejo);
+        FlushInstructionCache(GetCurrentProcess(), p[i] + 2, 1);
+    }
+    l_ini(&l); l_s(&l, "[texturas] hilos de carga: "); l_u(&l, n); l_s(&l, " (de 128)"); l_fin(&l);
 }
 
 /* YO2ONLINE_SKIPINTRO=1|2 (pruebas: arranques mas cortos). Las escenas se piden con FUN_0061c2c0(id, 1, 1); ids de la fabrica
@@ -920,7 +950,6 @@ static NOINL void ventana_instalar(void) {
     }
     ENG(g_o_d3dcreate8, "d3d8.dll", "Direct3DCreate8", h_d3dcreate8);
 #undef ENG
-    if (GetEnvironmentVariableA("YO2ONLINE_WINDOW_FORCEFS", v, sizeof v) > 0 && v[0] == '1') forzar_pantalla_completa();
     log1(ok ? "[ventana] ganchos OK" : "[ventana] ganchos: FALLO (la ventana se queda como estaba)", "");
 }
 
@@ -980,7 +1009,12 @@ static NOINL void iniciar(void) {
 
     /* Ventana ampliada: opcional como el aviso (si falla se apunta y el juego sigue como siempre). */
     if (g_vmodo != VW_ORIG) ventana_instalar();
+    cargadores_instalar();   /* opcional: menos hilos de carga de texturas (navegador) */
     saltar_intro();          /* opcional: YO2ONLINE_SKIPINTRO (pruebas) */
+    /* Tambien sin ventana ampliada: en el navegador (Boxedwine, escritorio de 1024x768) la ventana con marco no cabe y el
+     * area cliente se queda en 1018x736; asi el raton del juego coincide con la pantalla. («fullscreen = 1» en system.bin
+     * cuelga el cliente en Boxedwine antes de dibujar nada.) */
+    if (GetEnvironmentVariableA("YO2ONLINE_WINDOW_FORCEFS", v, sizeof v) > 0 && v[0] == '1') forzar_pantalla_completa();
 
     /* El lanzador busca esta linea: sin ella, la proxima vez vuelve a frida. */
     if (red) log1(ok ? "ganchos OK" : "ganchos: FALLO", "");

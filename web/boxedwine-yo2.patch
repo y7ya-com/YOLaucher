@@ -1,0 +1,245 @@
+diff --git a/project/emscripten/boxedwine-shell.js b/project/emscripten/boxedwine-shell.js
+index b96bc75a..91f85a14 100644
+--- a/project/emscripten/boxedwine-shell.js
++++ b/project/emscripten/boxedwine-shell.js
+@@ -785,6 +785,13 @@
+             	let uint8Array = getBase64Data(Config.appPayload);
+             	createFile("/", Config.payloadZipFile, uint8Array);
+                 callback();
++            }else if(Config.appZipFile.length > 0 && getParameter("lazyapp")){
++                // lazy: Boxedwine only reads the zip's index at mount, then seeks per file, so range reads suffice
++                fetch(Config.locateAppBaseUrl + Config.appZipFile, {method: "HEAD"}).then(function (r) {
++                    createLazyFile("/", Config.appZipFile, Config.locateAppBaseUrl + Config.appZipFile, Number(r.headers.get("Content-Length")));
++                    console.log("lazy app zip: " + Config.appZipFile);
++                    callback();
++                });
+             }else if(Config.appZipFile.length > 0){
+             	loadFile(Config.locateAppBaseUrl, Config.appZipFile, (uint8Array) => {
+             		if (Config.Program.length > 0) {            	
+@@ -1022,6 +1029,12 @@
+             }
+         }
+         function initBrowserFilesystem(callback) {
++            var lazyManifest = getParameter("lazy");
++            if (lazyManifest && !callback.lazy) {
++                var next = function () { setupLazyDrive(decodeUrlValue(lazyManifest), Config.d_drive).then(callback); };
++                next.lazy = true;
++                return initBrowserFilesystem(next);
++            }
+     		console.log("Use Storage mode: "+Config.storageMode);
+             console.log("Use Root FS storage mode: "+Config.rootStorageMode);
+             FS.mkdirTree(ROOT);
+@@ -2208,6 +2221,38 @@
+             finishPresent(presentState);
+           };
+         })(),
++        // Bottom-up RGBA rows read back from the GL pthread's WebGL canvas (see boxedwinePresentCurrentWebGLFrame).
++        boxedwinePresentPixels: (function() {
++          var canvas = null;
++          var context = null;
++          return function(buffer, presentState, width, height) {
++            canvas = canvas || document.getElementById('boxedwine-webgl-canvas-0');
++            if (canvas && buffer) {
++              if (canvas.width !== width) {
++                canvas.width = width;
++              }
++              if (canvas.height !== height) {
++                canvas.height = height;
++              }
++              var canvasFrame = canvas.parentElement;
++              if (canvasFrame) {
++                canvasFrame.style.setProperty("--boxedwine-canvas-width", width || 800);
++                canvasFrame.style.setProperty("--boxedwine-canvas-height", height || 600);
++              }
++              var rows = new Uint8ClampedArray(buffer);
++              var flipped = new Uint8ClampedArray(rows.length);
++              var stride = width * 4;
++              for (var y = 0; y < height; y++) {
++                flipped.set(rows.subarray((height - 1 - y) * stride, (height - y) * stride), y * stride);
++              }
++              context = context || canvas.getContext("2d");
++              context.putImageData(new ImageData(flipped, width, height), 0, 0);
++            }
++            if (presentState && typeof Atomics !== "undefined") {
++              Atomics.store(presentState, 0, 0);
++            }
++          };
++        })(),
+         boxedwinePresentSoftwareFrame: (function() {
+           var canvas = null;
+           var context = null;
+diff --git a/project/emscripten/boxedwine-webgl-streaming.js b/project/emscripten/boxedwine-webgl-streaming.js
+new file mode 100644
+index 00000000..12ae0b35
+--- /dev/null
++++ b/project/emscripten/boxedwine-webgl-streaming.js
+@@ -0,0 +1,79 @@
++// Small bufferSubData updates into a large WebGL buffer are very slow on ANGLE's Metal backend (Chrome on macOS):
++// while the GPU still uses the buffer, each update costs about a copy of the whole buffer. WineD3D streams vertices
++// into one 16 MB buffer with a tiny update per draw, so a D3D8 dialog screen with ~200 sprites spent ~250 ms per
++// frame waiting on the GPU. Route such updates through a small staging buffer and a GPU-side copyBufferSubData,
++// which is ordered like the original update (~17 ms per frame in the same pattern).
++(function() {
++    if (typeof WebGL2RenderingContext === 'undefined') {
++        return;
++    }
++    var P = WebGL2RenderingContext.prototype;
++    var LARGE_BUFFER = 1 << 20;
++    var MAX_UPDATE = 16 << 10;
++    var STAGE_SIZE = 64 << 10;
++    var sizes = new WeakMap();
++    var stages = new WeakMap();
++    var bufferData = P.bufferData;
++    var bufferSubData = P.bufferSubData;
++
++    function bindingOf(gl, target) {
++        switch (target) {
++            case gl.ARRAY_BUFFER: return gl.ARRAY_BUFFER_BINDING;
++            case gl.COPY_READ_BUFFER: return gl.COPY_READ_BUFFER_BINDING;
++            case gl.COPY_WRITE_BUFFER: return gl.COPY_WRITE_BUFFER_BINDING;
++            case gl.UNIFORM_BUFFER: return gl.UNIFORM_BUFFER_BINDING;
++            case gl.TRANSFORM_FEEDBACK_BUFFER: return gl.TRANSFORM_FEEDBACK_BUFFER_BINDING;
++        }
++        return 0;   // ELEMENT_ARRAY_BUFFER can't take a copy from a non-index buffer; pixel buffers stay as they are
++    }
++
++    function byteLength(data, srcOffset, length) {
++        if (typeof data === 'number') {
++            return data;
++        }
++        if (!data) {
++            return 0;
++        }
++        var element = data.BYTES_PER_ELEMENT || 1;
++        return length ? length * element : data.byteLength - (srcOffset || 0) * element;
++    }
++
++    P.bufferData = function(target, data, usage, srcOffset, length) {
++        var result = bufferData.apply(this, arguments);
++        var binding = bindingOf(this, target);
++        var buffer = binding && this.getParameter(binding);
++        if (buffer) {
++            sizes.set(buffer, byteLength(data, srcOffset, length));
++        }
++        return result;
++    };
++
++    P.bufferSubData = function(target, dstOffset, data, srcOffset, length) {
++        var binding = bindingOf(this, target);
++        var n = byteLength(data, srcOffset, length);
++        var buffer = binding && n <= MAX_UPDATE && this.getParameter(binding);
++        if (!buffer || (sizes.get(buffer) || 0) < LARGE_BUFFER) {
++            return bufferSubData.apply(this, arguments);
++        }
++        var stageTarget = target === this.COPY_READ_BUFFER ? this.COPY_WRITE_BUFFER : this.COPY_READ_BUFFER;
++        var previous = this.getParameter(bindingOf(this, stageTarget));
++        var stage = stages.get(this);
++        if (!stage) {
++            stage = {buffer: this.createBuffer(), offset: STAGE_SIZE};
++            stages.set(this, stage);
++        }
++        this.bindBuffer(stageTarget, stage.buffer);
++        if (stage.offset + n > STAGE_SIZE) {
++            bufferData.call(this, stageTarget, STAGE_SIZE, this.STREAM_DRAW);
++            stage.offset = 0;
++        }
++        if (arguments.length > 3) {
++            bufferSubData.call(this, stageTarget, stage.offset, data, srcOffset, length);
++        } else {
++            bufferSubData.call(this, stageTarget, stage.offset, data);
++        }
++        this.copyBufferSubData(stageTarget, target, stage.offset, dstOffset, n);
++        stage.offset += (n + 15) & ~15;
++        this.bindBuffer(stageTarget, previous);
++    };
++})();
+diff --git a/project/emscripten/server.mjs b/project/emscripten/server.mjs
+index 02f85274..627b2472 100644
+--- a/project/emscripten/server.mjs
++++ b/project/emscripten/server.mjs
+@@ -103,7 +103,25 @@ const server = createServer(async (request, response) => {
+         response.end("Not found");
+         return;
+     }
++    // ponytail: single-range only (what the lazy drive sends)
++    const range = /^bytes=(\d+)-(\d*)$/.exec(request.headers.range || "");
++    if (range) {
++        const size = finalFile.info.size;
++        const start = Number(range[1]);
++        const end = Math.min(range[2] ? Number(range[2]) : size - 1, size - 1);
++        response.writeHead(206, {
++            "Content-Length": end - start + 1,
++            "Content-Range": `bytes ${start}-${end}/${size}`,
++            "Content-Type": "application/octet-stream",
++            "Cross-Origin-Embedder-Policy": "require-corp",
++            "Cross-Origin-Opener-Policy": "same-origin",
++            "Cross-Origin-Resource-Policy": "same-origin",
++        });
++        createReadStream(finalFile.path, { start, end }).pipe(response);
++        return;
++    }
+     response.writeHead(200, {
++        "Accept-Ranges": "bytes",
+         "Content-Length": finalFile.info.size,
+         "Content-Type": mimeTypes.get(extname(finalFile.path)) || "application/octet-stream",
+         "Cross-Origin-Embedder-Policy": "require-corp",
+diff --git a/source/opengl/sdl/sdlgl.cpp b/source/opengl/sdl/sdlgl.cpp
+index af26592e..419235a8 100644
+--- a/source/opengl/sdl/sdlgl.cpp
++++ b/source/opengl/sdl/sdlgl.cpp
+@@ -283,19 +283,24 @@ EM_JS(void, boxedwinePresentCurrentWebGLFrame, (int requestedWidth, int requeste
+         }
+         return;
+     }
+-    if (typeof source.transferToImageBitmap !== 'function') {
+-        if (presentState) {
+-            Atomics.store(presentState, 0, 0);
+-        }
+-        return;
+-    }
++    // Read the frame back instead of transferring an ImageBitmap. A transferred WebGL bitmap's GPU buffer is released
++    // by a task on the producing thread, and this GL pthread never returns to its event loop, so every presented frame
++    // stayed allocated in the browser's GPU process (about 70 MB/s for a 1024x768 game at 30 fps).
+     try {
+-        var bitmap = source.transferToImageBitmap();
++        var gl = GL.currentContext.GLctx;
++        var pixels = new Uint8Array(sw * sh * 4);
++        var readFb = gl.getParameter(gl.READ_FRAMEBUFFER_BINDING);
++        var packBuffer = gl.getParameter(gl.PIXEL_PACK_BUFFER_BINDING);
++        if (readFb) gl.bindFramebuffer(gl.READ_FRAMEBUFFER, null);
++        if (packBuffer) gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
++        gl.readPixels(sx, source.height - sy - sh, sw, sh, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
++        if (readFb) gl.bindFramebuffer(gl.READ_FRAMEBUFFER, readFb);
++        if (packBuffer) gl.bindBuffer(gl.PIXEL_PACK_BUFFER, packBuffer);
+         postMessage({
+             cmd: bwCallHandlerCmd,
+-            handler: 'boxedwinePresentFrame',
+-            args: [bitmap, presentState, sx, sy, sw, sh]
+-        }, [bitmap]);
++            handler: 'boxedwinePresentPixels',
++            args: [pixels.buffer, presentState, sw, sh]
++        }, [pixels.buffer]);
+     } catch (e) {
+         if (presentState) {
+             Atomics.store(presentState, 0, 0);
+diff --git a/project/emscripten/makefile b/project/emscripten/makefile
+--- a/project/emscripten/makefile
++++ b/project/emscripten/makefile
+@@ -33,7 +33,7 @@
+ multiThreaded: export EXTRA_CPP_FLAGS := -DBOXEDWINE_MULTI_THREADED -pthread
+ multiThreaded: export BUILD_DIR := Build/MultiThreaded
+ multiThreaded: export SHELL_FILE := shell.html
+-multiThreaded: export EXTRA_LD_FLAGS := -pthread -sPTHREAD_POOL_SIZE=16 -sPROXY_TO_PTHREAD=1 -sOFFSCREENCANVAS_SUPPORT=1 -sOFFSCREENCANVASES_TO_PTHREAD=\#canvas --js-library=boxedwine-multithreaded-helper.js $(RUNTIME_MEMORY_FLAGS)
++multiThreaded: export EXTRA_LD_FLAGS := -pthread --pre-js=boxedwine-webgl-streaming.js -sPTHREAD_POOL_SIZE=16 -sPROXY_TO_PTHREAD=1 -sOFFSCREENCANVAS_SUPPORT=1 -sOFFSCREENCANVASES_TO_PTHREAD=\#canvas --js-library=boxedwine-multithreaded-helper.js $(RUNTIME_MEMORY_FLAGS)
+ multiThreaded: export ASSET_FILES := boxedwine.css fsfs.js boxedwine-shell.js $(ZIP_ASSET_FILES)
+ # WASM JIT build: emits each basic block as a raw one-function WASM module, then installs it standalone or merges it into a bounded runtime group.
+ # Key flags:
+@@ -93,7 +93,7 @@
+ multiThreadedJit: export SHELL_FILE := shell.html
+ # HEAPU8/_malloc/_free: used by boxedwine-shell.js (onRuntimeInitialized) to
+ # copy server-zip cache entries into wasm memory for _wasm_jit_mt_register.
+-multiThreadedJit: export EXTRA_LD_FLAGS := $(WASM_JIT_SIMD_FLAG) -pthread -sPROXY_TO_PTHREAD=1 -sOFFSCREENCANVAS_SUPPORT=1 -sOFFSCREENCANVASES_TO_PTHREAD=\#canvas --pre-js=boxedwine-wasm-jit-module-broker.js --js-library=boxedwine-multithreaded-helper.js -sPTHREAD_POOL_SIZE=$(or $(PTHREAD_POOL_SIZE),32) -sALLOW_TABLE_GROWTH $(RUNTIME_MEMORY_FLAGS) -sEXPORTED_RUNTIME_METHODS=addFunction,removeFunction,wasmTable,HEAPU8$(JIT_CCALL_EXPORTS) -sEXPORTED_FUNCTIONS=_main,_wasm_jit_mt_register,_wasm_jit_mt_register_group,_wasm_jit_mt_register_group_entry,_wasm_jit_mt_register_group_patch,_wasm_jit_mt_prepare_export,_wasm_jit_mt_set_module_broker_enabled,_wasm_jit_mt_broker_validate_module,_wasm_jit_mt_take_thread_start_owner,_wasm_jit_mt_copy_runtime_batch_stats,_wasm_jit_mt_record_group_worker_event,_wasm_jit_set_persistence_active,_wasm_jit_set_record_active,_malloc,_free
++multiThreadedJit: export EXTRA_LD_FLAGS := $(WASM_JIT_SIMD_FLAG) -pthread --pre-js=boxedwine-webgl-streaming.js -sPROXY_TO_PTHREAD=1 -sOFFSCREENCANVAS_SUPPORT=1 -sOFFSCREENCANVASES_TO_PTHREAD=\#canvas --pre-js=boxedwine-wasm-jit-module-broker.js --js-library=boxedwine-multithreaded-helper.js -sPTHREAD_POOL_SIZE=$(or $(PTHREAD_POOL_SIZE),32) -sALLOW_TABLE_GROWTH $(RUNTIME_MEMORY_FLAGS) -sEXPORTED_RUNTIME_METHODS=addFunction,removeFunction,wasmTable,HEAPU8$(JIT_CCALL_EXPORTS) -sEXPORTED_FUNCTIONS=_main,_wasm_jit_mt_register,_wasm_jit_mt_register_group,_wasm_jit_mt_register_group_entry,_wasm_jit_mt_register_group_patch,_wasm_jit_mt_prepare_export,_wasm_jit_mt_set_module_broker_enabled,_wasm_jit_mt_broker_validate_module,_wasm_jit_mt_take_thread_start_owner,_wasm_jit_mt_copy_runtime_batch_stats,_wasm_jit_mt_record_group_worker_event,_wasm_jit_set_persistence_active,_wasm_jit_set_record_active,_malloc,_free
+ multiThreadedJit: export ASSET_FILES := boxedwine.css fsfs.js boxedwine-shell.js $(ZIP_ASSET_FILES)
+ automationMultiThreadedJit: export BUILD_DIR := Build/AutomationMultiThreadedJit
+ automationMultiThreadedJit: export EXTRA_CPP_FLAGS := -DBOXEDWINE_MULTI_THREADED -DBOXEDWINE_WASM_JIT -DBOXEDWINE_RECORDER $(WASM_JIT_SIMD_FLAG) -pthread
