@@ -886,3 +886,15 @@ Tests: `python fake_client.py salas --offset <n>` (own instance with `YO2_ROOM_P
 Spanish and B in French; same Spanish room = they see each other, Spanish and French = they do not, world = they do,
 world and Spanish = they do not, gate counts per room, Spanish Academy with area 5. Unit tests: `yo2srv/tests/test_red.py`
 (`TestPuertos`, `TestGate`).
+
+## Two players behind one IP: per-connection numbering (26-10, web)
+
+The client drops every message whose number is not its counter + 1 (`FUN_0068bac0`, per connection). Since 2026-10-06
+`Conn.seq` was one counter per (client IP, port) on every port, so that a client's second duel connection continues
+its count. On the public web build every player reaches the server through the network gateway from 127.0.0.1, so
+two players in one room shared a counter. When B entered a block where A already was, the 0x3112 (and the 0x4181)
+the hub posts to A spent B's numbers. B then dropped its own 0x4211 and 0x4171 and stayed in My Room, and A got
+numbers out of order too. Fix (`yo2srv/red/conexion.py`): lobby, rooms and accounts count per connection (they always
+start at #1). Only the gate and the duel port keep a client's count across connections, keyed by (account, or IP on
+the gate, port, the client's next message number). Tests: `test_red.TestMismaIP`, which uses three real TCP
+connections from the same 127.0.0.1.

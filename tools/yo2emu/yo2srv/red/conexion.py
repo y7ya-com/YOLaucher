@@ -3,7 +3,7 @@
 Es la clase de run.py de siempre, SIN cambiar la lógica: el cliente exige que los mensajes que recibe vayan numerados
 1, 2, 3... (campo «parámetro» de la cabecera) y procesa uno por fotograma, así que se mandan en cola y con pausa. La
 numeración de la PUERTA y del DUELO sobrevive a las reconexiones de un mismo cliente en `Conn.GATE_SEQ` (el MISMO dict
-que antes: lo usan los hot_*.py y las pruebas por `Conn.GATE_SEQ`).
+que antes: lo usan los hot_*.py y las pruebas por `Conn.GATE_SEQ`), por cliente y no por IP (26-10: ver `seq`).
 
 Lo que cambia es de dónde sale cada nombre externo (regla de oro de §2.3): `log`, `current_conn` (la reasignan las
 cargas en caliente) y `_duel_ticket_issue` (la reserva de duelo, de run.py) se leen SIEMPRE como `srv.X` en el momento de
@@ -35,39 +35,69 @@ class Conn:
     # número no es contador + 1). En el log, toda conexión de cuentas, lobby, sala o duelo empieza en #1; solo la
     # puerta (5730) sigue la cuenta entre conexiones del mismo cliente (#3, #5... en la 2.ª y 3.ª). Antes era un
     # contador por PUERTO compartido por todos: con dos clientes, cada envío a uno desfasaba al otro para siempre.
-    # Ahora: contador propio de cada conexión, y para la puerta uno por IP del cliente (GATE_SEQ). Se reinicia cuando
-    # el cliente vuelve a empezar desde #1 (cliente reiniciado). Dos clientes en el MISMO PC solo se distinguen en la
-    # puerta si salen de IPs de loopback distintas (net_hook YO2_LOCAL_IP).
+    # Ahora: contador propio de cada conexión, y en la puerta y el duelo uno por cliente (GATE_SEQ, ver `seq`). Se
+    # reinicia cuando el cliente vuelve a empezar desde #1 (cliente reiniciado).
     GATE_SEQ = {}
     MAX_DATA = 1024   # B04: FUN_00689ea0 -> si el largo > 0x400, estado 0xff y el flujo queda desalineado para siempre
     def __init__(self, sock, port):
         self.sock, self.port = sock, port
         self.lock = threading.Lock()
         self.closed = False
-        self._seq = 0
+        self._seq = 0                          # número del último mensaje mandado por ESTA conexión
+        self._last = self._pend = self._kept = None   # último número del cliente; cuenta a seguir al saber la cuenta
         self.sess = None                       # sesión de la cuenta (0x3003; en duelo, el pid de 0x6001)
         self._outq = None                      # cola de envío (post), se crea con el primer uso
         self._qlock = threading.Lock()         # no self.lock: send lo tiene cogido mientras duerme su pausa
         try:
             self.peer = sock.getpeername()[0]
-        except OSError:
+        except (OSError, IndexError):          # IndexError: socket sin IP de par (socketpair AF_UNIX de las pruebas)
             self.peer = "?"
     # 2026-10-06, en vivo: el 2.º duelo se colgaba. La conexión de duelo NUEVA llega con el número del cliente seguido
     # (0x6001 #25) y espera que el servidor también siga su cuenta en ese puerto; con el contador por conexión le
-    # llegaba #1 y lo tiraba (FUN_0068bac0). Igual que la puerta: un contador por (IP del cliente, puerto) que sobrevive
-    # a las reconexiones y se reinicia cuando el cliente manda #1 (saw_client). Lobby y salas empiezan en #1 y se
-    # reinician solos. Dos clientes en el MISMO PC necesitan IPs de loopback distintas (net_hook YO2_LOCAL_IP).
+    # llegaba #1 y lo tiraba (FUN_0068bac0). Igual en la puerta. Solo esos dos puertos siguen la cuenta entre conexiones;
+    # lobby, salas y cuentas empiezan en #1 y llevan su contador propio (self._seq).
+    # 26-10 (web): antes el contador de TODOS los puertos era uno por (IP, puerto). En la web pública todos los jugadores
+    # llegan por la pasarela desde 127.0.0.1: compartían número, y cada aviso a uno (0x3112, 0x4181) desfasaba al otro,
+    # que tiraba en silencio lo siguiente (el que entraba en un bloque ocupado se quedaba en My Room). Ahora la cuenta
+    # que sobrevive va por (cuenta o IP, puerto, número del siguiente mensaje del cliente): dos clientes tras la misma IP
+    # no se pisan. La clave (cuenta o IP, puerto) queda como respaldo (lo de antes) si no hay otra.
+    def _keeps_count(self):
+        return self.port in (getattr(srv, "GATE_PORT", None), getattr(srv, "DUEL_PORT", None))
+    def _who(self):
+        return getattr(getattr(self, "sess", None), "acct", None) or self.peer
     @property
     def seq(self):
-        return Conn.GATE_SEQ.get((self.peer, self.port), 0)
+        n = getattr(self, "_pend", None)
+        if n is not None and getattr(getattr(self, "sess", None), "acct", None):
+            self._pend = None                    # duelo: la cuenta ya se sabe (0x6001 -> attach): su cuenta seguida
+            self._seq = Conn.GATE_SEQ.get((self._who(), self.port, n), Conn.GATE_SEQ.get((self._who(), self.port), 0))
+        return self._seq
     @seq.setter
     def seq(self, v):
-        Conn.GATE_SEQ[(self.peer, self.port)] = v
+        self._seq = v
+        self._keep()
+    def _keep(self):
+        last = getattr(self, "_last", None)
+        if last is None or not self._keeps_count():
+            return
+        old, k = getattr(self, "_kept", None), (self._who(), self.port, last + 1)
+        if old is not None and old != k:
+            Conn.GATE_SEQ.pop(old, None)
+        Conn.GATE_SEQ[k] = Conn.GATE_SEQ[(self._who(), self.port)] = self._seq
+        self._kept = k
     def saw_client(self, param):
         # 07-10 (−242, research/cuentas/NOTES.md §6): hora del último mensaje del cliente por esta conexión. Lo llama
         # _handle con CADA mensaje (también los lectores de antes de una carga en caliente: es un método de la clase).
         self.rx_t = time.time()
-        if param == 1: self.seq = 0
+        if param == 1:
+            self._seq, self._pend = 0, None
+        elif getattr(self, "_last", None) is None and self._keeps_count():   # 1.er mensaje: sigue la cuenta del cliente
+            if self.port == getattr(srv, "DUEL_PORT", None) and not getattr(getattr(self, "sess", None), "acct", None):
+                self._pend = param               # la cuenta llega con el 0x6001 (attach): se mira al contestar
+            else:
+                self._seq = Conn.GATE_SEQ.get((self._who(), self.port, param), Conn.GATE_SEQ.get((self._who(), self.port), 0))
+        self._last = param
+        self._keep()
     def stale(self):
         """True si ya no se debe mandar por aquí: cerrada, o ESTE cliente ya usa otra conexión de este puerto (su
         sesión, o su IP mientras no tiene sesión). Antes miraba CONNS[puerto]: con dos clientes, la conexión del

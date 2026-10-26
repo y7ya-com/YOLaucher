@@ -85,13 +85,12 @@ class TestConn(unittest.TestCase):
         self.addCleanup(conexion.Conn.GATE_SEQ.pop, (self.c.peer, 5732), None)
         conexion.Conn.GATE_SEQ.pop((self.c.peer, 5732), None)
 
-    def test_numeracion_por_conexion_y_gate_seq(self):
+    def test_numeracion_por_conexion(self):
         self.c.send(0x2002, b"ab", pause=0)
         self.c.send(0x2004, b"", pause=0)
         self.assertEqual(leer(self.b, 2), [(0x2002, 1, b"ab"), (0x2004, 2, b"")])
-        self.assertEqual(conexion.Conn.GATE_SEQ[(self.c.peer, 5732)], 2)       # el MISMO dict de clase de siempre
+        self.assertNotIn((self.c.peer, 5732), conexion.Conn.GATE_SEQ, "el lobby no sigue la cuenta entre conexiones")
         self.c.saw_client(1)                                                    # el cliente vuelve a empezar desde #1
-        self.assertEqual(conexion.Conn.GATE_SEQ[(self.c.peer, 5732)], 0)
         self.c.send(0x2004, b"", pause=0)
         self.assertEqual(leer(self.b), [(0x2004, 1, b"")])
         self.assertTrue(hasattr(self.c, "rx_t"))
@@ -176,6 +175,63 @@ class TestCurrentConn(unittest.TestCase):
         self.assertIsInstance(servidor.PEER_CONNS, dict)
         self.assertIsInstance(servidor.CONNS, dict)
         self.assertIsNot(servidor.PEER_CONNS, servidor.CONNS)
+
+
+class TestMismaIP(unittest.TestCase):
+    """26-10 (web pública): todos los jugadores llegan por la pasarela desde 127.0.0.1. Con un contador por (IP, puerto),
+    el aviso 0x3112 al que ya estaba en el bloque gastaba el número del que entraba: el que entraba tiraba su 0x4211 y su
+    0x4171 (FUN_0068bac0) y se quedaba en My Room. Aquí cada socketpair tiene la MISMA IP de par, como tras la pasarela."""
+
+    def setUp(self):
+        enlazar(espacio(GATE_PORT=5730))
+        self.socks = []
+        conexion.Conn.GATE_SEQ.clear()
+        self.addCleanup(conexion.Conn.GATE_SEQ.clear)
+
+    def conn(self, port, acct=None):
+        ls = socket.create_server(("127.0.0.1", 0))              # TCP de verdad: par 127.0.0.1 (socketpair es AF_UNIX
+        b = socket.create_connection(ls.getsockname())           # fuera de Windows y no tiene IP de par)
+        a, _ = ls.accept()
+        ls.close()
+        self.addCleanup(a.close)
+        self.addCleanup(b.close)
+        c = conexion.Conn(a, port)
+        c.sess = types.SimpleNamespace(acct=acct) if acct else None
+        return c, b
+
+    def manda(self, c, n):
+        for _ in range(n):
+            c.send(0x0004, b"", pause=0)
+
+    def test_dos_clientes_en_la_misma_sala(self):
+        (a, ra), (b, rb) = self.conn(5745, "A"), self.conn(5745, "B")
+        self.assertEqual(a.peer, b.peer)
+        self.manda(a, 3)
+        b.post(0x3112, b"aviso de A", pause=0)                  # lo que manda el hub a B mientras A entra
+        self.manda(a, 1)
+        self.assertEqual([p for _, p, _ in leer(ra, 4)], [1, 2, 3, 4])
+        self.assertEqual(leer(rb), [(0x3112, 1, b"aviso de A")])
+
+    def test_duelo_sigue_la_cuenta_de_su_cuenta(self):
+        """2.º duelo de A (0x6001 #4, sin sesión hasta el attach) tras un duelo de B desde la misma IP: sigue la de A."""
+        a1, ra1 = self.conn(5760, "A")
+        a1.saw_client(1); self.manda(a1, 2); a1.saw_client(2); self.manda(a1, 1); a1.saw_client(3)
+        b1, rb1 = self.conn(5760, "B")
+        b1.saw_client(1); self.manda(b1, 5); b1.saw_client(2)
+        a2, ra2 = self.conn(5760)
+        a2.saw_client(4)                                         # 0x6001 #4: aún no se sabe de quién es
+        a2.sess = types.SimpleNamespace(acct="A")                # HUB.attach con el pid del 0x6001
+        self.manda(a2, 1)
+        self.assertEqual(leer(ra2), [(0x0004, 4, b"")])
+        self.assertEqual([p for _, p, _ in leer(rb1, 5)], [1, 2, 3, 4, 5])
+
+    def test_puerta_sigue_la_cuenta_entre_conexiones(self):
+        g1, r1 = self.conn(5730)
+        g1.saw_client(1); self.manda(g1, 7); g1.saw_client(2)
+        g2, r2 = self.conn(5730)
+        g2.saw_client(3)                                         # 2.ª visita a la puerta: el cliente sigue en #3
+        self.manda(g2, 1)
+        self.assertEqual(leer(r2), [(0x0004, 8, b"")])
 
 
 class TestHandle(unittest.TestCase):
