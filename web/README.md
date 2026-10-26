@@ -59,12 +59,40 @@ Things that had to change:
   "version"="native,builtin"` worked. Build the DLL with `build_dll.ps1`'s flags (`-nostdlib -ffreestanding
   -Wl,--entry,_DllMain@12 ... -lkernel32 -luser32 -lgdi32`).
 - **Launch** through a `.bat`: `regedit /S yo2.reg`, `set YO2ONLINE_NET=1`, `yo2.exe`.
-- **Sound on crashed the emulator** right after the client opened audio: `kpanic("Failed to queue SDL callback")`,
-  meaning the main thread's SDL event queue was full. `sound=false` avoids it.
+- **Sound on crashed the emulator** right after the client opened audio: `kpanic("Failed to queue SDL callback")`.
+  2026-10-26: not reproduced with current builds. The game only opens audio when `Sound.dat` (416 MB, left out of the
+  lean zip) is in the game folder; with it, the non-JIT build (Build/MultiThreaded) opened audio through the
+  AudioWorklet (`openAudio: freq=11025 ... channels=2`) and sat at the title with menu hover for a minute, no crash.
+  Audio never calls `sdlDispatch`, and every caller waits for its callback, so the queue can't fill from callbacks;
+  the likely cause was `SDL_PushEvent` failing on `SDL_malloc` near the JIT build's 3 GB heap (it reached 3.6 GB).
+  `web/boxedwine-sound.patch` (on 2dbabfc) waits and retries instead of the kpanic, logging `BWSDLQ` with SDL's error
+  and the queue contents once a second, so the next occurrence names its cause instead of killing the tab.
 
 > ⚠️ **Memory.** Never pass the game as a single `app` zip with `storage=memory`. Boxedwine downloads the whole
 > 1.1 GB zip into the page and copies it into its in-memory filesystem, so it takes several GB of RAM per load, and
 > repeated reloads exhausted the test Mac's memory.
+
+### Boot overlay (2026-10-26)
+
+The web filesystem's Wine prefix is already initialised (`.update-timestamp`), so Wine never rebuilds it and a
+"pre-booted" snapshot saves little. Boot time goes to the services wineboot starts and to yo2.exe's own startup.
+`python3 web/bootoverlay.py site/boxedwine.zip site/overlay.zip` writes a 2-file overlay (system.reg + user.reg):
+the yo2net `version` DllOverride baked in, winemenubuilder disabled, Eventlog and PlugPlay (plugplay.exe, winebus,
+winehid, the failing winebth) set to Start=4. Add `&overlay=overlay.zip` to the URL. MountMgr and NDIS/nsiproxy stay.
+
+Measured on the non-JIT build, seconds after Wine launch (`Launching` in the console):
+
+| run | yo2.exe starts | game window (KONAMI) |
+|---|---|---|
+| no overlay (2 runs) | 14, 14 | 32, 32 |
+| overlay keeping PlugPlay | 14 | 33 |
+| overlay | 12 | (logging cut; KONAMI on screen) |
+| overlay, machine at load 56 | 19 | 45 (noise) |
+
+So about 2 s from the services, still to confirm with A/B pairs at load < 6. The rest is yo2.exe itself: ~13 s
+between its GL init and its game window (the updater's HTTP fetches, then a quiet gap). With the overlay, start.bat's
+`regedit /S yo2.reg` line is redundant (about 1 s). `wine-override=nomono` changes nothing here: the prefix is current,
+so wineboot doesn't install Mono or Gecko.
 
 ### Lazy loading (solved)
 

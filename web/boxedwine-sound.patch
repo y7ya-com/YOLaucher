@@ -1,0 +1,37 @@
+diff --git a/platform/sdl/sdlcallback.cpp b/platform/sdl/sdlcallback.cpp
+index d11447ea..eaaadc49 100644
+--- a/platform/sdl/sdlcallback.cpp
++++ b/platform/sdl/sdlcallback.cpp
+@@ -21,6 +21,7 @@
+ 
+ #include <SDL.h>
+ #include "sdlcallback.h"
++#include <map>
+ 
+ extern U32 sdlCustomEvent;
+ extern SDL_threadID sdlMainThreadId;
+@@ -64,11 +65,19 @@ U32 sdlDispatch(std::function<U32()> p) {
+     {
+         BOXEDWINE_CRITICAL_SECTION_WITH_CONDITION(callback->cond);
+         callback->completed = false;
+-        if (SDL_PushEvent(&callback->sdlEvent) != 1) {
+-            callback->pfn = nullptr;
+-            freeSdlCallback(callback);
+-            kpanic("Failed to queue SDL callback");
+-            return 0;
++        // A full queue (65535 events) or a failed SDL_malloc near the wasm heap cap is transient: wait for the UI thread
++        // to drain instead of kpanic("Failed to queue SDL callback"), and log what the queue holds once a second.
++        for (int tries = 0; SDL_PushEvent(&callback->sdlEvent) != 1; tries++) {
++            if (tries % 1000 == 0) {
++                static SDL_Event peek[4096];
++                int n = SDL_PeepEvents(peek, 4096, SDL_PEEKEVENT, SDL_FIRSTEVENT, SDL_LASTEVENT);
++                std::map<U32, int> types;
++                for (int i = 0; i < n; i++) types[peek[i].type]++;
++                BString hist;
++                for (auto& t : types) hist += BString::valueOf(t.first, 16) + B("=") + BString::valueOf((U32)t.second) + B(" ");
++                klog_fmt("BWSDLQ push failed try=%d err=%s peeked=%d custom=%x %s", tries, SDL_GetError(), n, sdlCustomEvent, hist.c_str());
++            }
++            BOXEDWINE_CONDITION_WAIT_TIMEOUT(callback->cond, 1);
+         }
+         // This is a host call whose captures can refer to the caller's stack.
+         // Guest signals, termination, and spurious wakeups must not release or
