@@ -10,6 +10,7 @@
  *   YO2_AVISO_SALA=1/0       el mismo interruptor que aviso_sala_hook.js (o el fichero yo2-aviso-sala.txt)
  *   YO2ONLINE_WINDOW=orig|1.5|2|fit  ventana ampliada (rx/PAN, 24-10; ver "ventana ampliada" mas abajo). Vacio u "orig" =
  *                            el juego tal cual. Funciona sola (sin YO2ONLINE_NET) y no hace falta nada mas.
+ *   YO2ONLINE_SKIPINTRO=1|2  pruebas: 1 = sin logo KONAMI, 2 = ademas sin la pantalla de normas (ver saltar_intro)
  *
  * Por que version.dll: yo2.exe la importa (GetFileVersionInfoA/SizeA, VerQueryValueA), no es una KnownDLL (Windows la
  * busca primero en la carpeta del exe) y tiene solo 17 exportaciones. winmm.dll NO: es la del mod offline de derplayer
@@ -854,6 +855,35 @@ static NOINL void forzar_pantalla_completa(void) {
     log1("[ventana] FORCEFS: el juego cree que esta en pantalla completa", "");
 }
 
+/* YO2ONLINE_SKIPINTRO=1|2 (pruebas: arranques mas cortos). Las escenas se piden con FUN_0061c2c0(id, 1, 1); ids de la fabrica
+ * FUN_0061dc30: 1 parcheador, 2 logo KONAMI, 3 clasificacion, 4 titulo, 5 normas (CCautionScene), 6 login.
+ *   1: el parcheador (CPatcherScene, push 2 en 0x6deebc) pide el titulo (4) en vez del logo. Se pierde la escena de
+ *      clasificacion (3), que el logo solo muestra en una region (FUN_007f0c50).
+ *   2: ademas ONLINE en el titulo (push 5 en 0x7fa658) va directo al login (6) sin las normas. Las normas son las que
+ *      piden info.html / stoplogin.html (aviso de mantenimiento): con el servidor local no hacen falta. */
+static NOINL void saltar_intro(void) {
+    static const BYTE esperado[2][3] = {{0x6a, 0x02, 0xe8}, {0x6a, 0x05, 0xe8}};
+    static const BYTE nuevo[2] = {0x04, 0x06};
+    BYTE *p[2];
+    unsigned n = leer_uint_env("YO2ONLINE_SKIPINTRO"), i, j;
+    DWORD viejo;
+    if (n == 0) return;
+    if (n > 2) n = 2;
+    p[0] = A(0x006deebc);
+    p[1] = A(0x007fa658);
+    for (i = 0; i < n; i++) {
+        if (!legible(p[i], 3)) return;
+        for (j = 0; j < 3; j++) if (p[i][j] != esperado[i][j]) { log1("[intro] bytes inesperados; no se toca", ""); return; }
+    }
+    for (i = 0; i < n; i++) {
+        if (!VirtualProtect(p[i] + 1, 1, PAGE_EXECUTE_READWRITE, &viejo)) return;
+        p[i][1] = nuevo[i];
+        VirtualProtect(p[i] + 1, 1, viejo, &viejo);
+        FlushInstructionCache(GetCurrentProcess(), p[i] + 1, 1);
+    }
+    log1(n == 1 ? "[intro] sin logo KONAMI" : "[intro] sin logo KONAMI ni normas", "");
+}
+
 static NOINL void ventana_instalar(void) {
     char v[8];
     Linea l;
@@ -950,6 +980,7 @@ static NOINL void iniciar(void) {
 
     /* Ventana ampliada: opcional como el aviso (si falla se apunta y el juego sigue como siempre). */
     if (g_vmodo != VW_ORIG) ventana_instalar();
+    saltar_intro();          /* opcional: YO2ONLINE_SKIPINTRO (pruebas) */
 
     /* El lanzador busca esta linea: sin ella, la proxima vez vuelve a frida. */
     if (red) log1(ok ? "ganchos OK" : "ganchos: FALLO", "");
