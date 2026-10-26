@@ -55,6 +55,12 @@ Add three files to `game/`:
   yo2.exe
   ```
 
+Set English (the stock `system.bin` says `language = 2`, German):
+
+```sh
+python3.12 <fork>/web/systembin.py game/system.bin language=1
+```
+
 Then zip them, store-only:
 
 ```sh
@@ -78,7 +84,7 @@ http://127.0.0.1:8002/boxedwine.html?app=yo2&lazyapp=1&p=start.bat&network=true&
 ## What it did
 
 - About 4 MB fetched to mount the zip. The updater fetched `/yo2/root.txt` and `/yo2/merge.txt` from run.py through
-  the gateway. Then the KONAMI logo, then the title menu (in German), after roughly 40–60 s. Only 38 MB of the zip
+  the gateway. Then the KONAMI logo, then the title menu (in German before the `system.bin` step), after roughly 40–60 s. Only 38 MB of the zip
   was fetched in total.
 - Memory: the page process was about 1.5–3 GB.
 - The Claude app's GPU helper then grew about 70 MB/s at the title screen (the leak), so cap runs to about 60 s past

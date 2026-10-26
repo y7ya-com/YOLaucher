@@ -46,7 +46,11 @@ The real `yo2.exe` Ver.080912 (its `merge.dat` matches `extraer_juego.py`'s SHA-
 - It showed the KONAMI logo, then the full **title menu rendered through D3D8 → WebGL**. Mouse hover worked.
 - Clicking ONLINE didn't register yet. The client probably reads mouse buttons via DirectInput (`dinput8`), which may
   miss short synthetic clicks. This is the next thing to solve.
-- The menu came up in German. The language setting still needs to be set the way the launcher does it.
+- The menu came up in German. Solved (2026-10-26): the language is `language = N` in `system.bin` (0 japanese,
+  1 english, 2 german, 3 french, 4 italian, 5 spanish, 6 korean), and the stock 2008 file ships `2`. YOLaucher's
+  launcher never touches it; players switched it in the client's Options dialog, which rewrites the file.
+  `python3.12 web/systembin.py game/system.bin language=1` sets English before zipping (format in the script: Blowfish,
+  key `nameko!`; a plaintext `system.txt` next to the exe is read instead if present). Verified: English title menu.
 
 Things that had to change:
 
