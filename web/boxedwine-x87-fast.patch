@@ -1,0 +1,17 @@
+diff --git a/source/emulation/cpu/common/fpu.cpp b/source/emulation/cpu/common/fpu.cpp
+index 86dca4bc..ef8e80ca 100644
+--- a/source/emulation/cpu/common/fpu.cpp
++++ b/source/emulation/cpu/common/fpu.cpp
+@@ -120,6 +120,12 @@ static void prepareSoftFloatArithmetic(FPU* fpu) {
+ 
+ static double roundCachedArithmeticResult(FPU* fpu, double value) {
+     if ((fpu->cw & 0x0300) == 0) {
++        // Single precision (Direct3D sets it) with round-to-nearest: the host's double->float conversion rounds once,
++        // to nearest even, exactly like the softfloat path below, at a fraction of the cost. NaNs keep the softfloat
++        // path so their payload is converted the x87 way.
++        if (fpu->round == ROUND_Nearest && value == value) {
++            return (double)(float)value;
++        }
+         long2Double source;
+         float64_sf sourceBits;
+         FPU_Float result;

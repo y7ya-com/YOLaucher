@@ -12,6 +12,7 @@
  *                            el juego tal cual. Funciona sola (sin YO2ONLINE_NET) y no hace falta nada mas.
  *   YO2ONLINE_TEXLOADERS=<n> solo navegador (Boxedwine): n hilos de carga de texturas en vez de 128 (ver cargadores_instalar)
  *   YO2ONLINE_SKIPINTRO=1|2  pruebas: 1 = sin logo KONAMI, 2 = ademas sin la pantalla de normas (ver saltar_intro)
+ *   YO2ONLINE_MAXSKIP=<n>    solo navegador: como mucho n pasos de logica sin dibujar (el juego trae 10; ver max_saltos)
  *
  * Por que version.dll: yo2.exe la importa (GetFileVersionInfoA/SizeA, VerQueryValueA), no es una KnownDLL (Windows la
  * busca primero en la carpeta del exe) y tiene solo 17 exportaciones. winmm.dll NO: es la del mod offline de derplayer
@@ -914,6 +915,29 @@ static NOINL void saltar_intro(void) {
     log1(n == 1 ? "[intro] sin logo KONAMI" : "[intro] sin logo KONAMI ni normas", "");
 }
 
+/* YO2ONLINE_MAXSKIP=<n> (0-9; sin la variable no se toca nada). El bucle del juego (FUN_00607fd0) avanza la logica a 30 Hz
+ * fijos (0x21 ms) y, si va con retraso, se salta el dibujado hasta 10 pasos seguidos (movl $0xa,-0x18(%ebp) en 0x6090b7;
+ * el contador es +0xc84, comparado en 0x6091d3). En el navegador cada paso de logica tarda mas de 33 ms, asi que el juego
+ * siempre va con retraso y solo dibuja 1 de cada 11 pasos (editor de mazos ~1 fps). Con n pequeno dibuja tras cada n+1
+ * pasos: va a camara lenta pero responde antes. Al dibujar con retraso el juego ya reinicia su horario (ahora + 33 ms). */
+static NOINL void max_saltos(void) {
+    static const BYTE esperado[7] = {0xc7, 0x45, 0xe8, 0x0a, 0x00, 0x00, 0x00};
+    char v[4];
+    unsigned n = leer_uint_env("YO2ONLINE_MAXSKIP"), j;
+    BYTE *p = A(0x006090b7);
+    DWORD viejo;
+    Linea l;
+    if (GetEnvironmentVariableA("YO2ONLINE_MAXSKIP", v, sizeof v) == 0) return;
+    if (n > 9) n = 9;
+    if (!legible(p, 7)) return;
+    for (j = 0; j < 7; j++) if (p[j] != esperado[j]) { log1("[bucle] bytes inesperados; no se toca", ""); return; }
+    if (!VirtualProtect(p + 3, 1, PAGE_EXECUTE_READWRITE, &viejo)) return;
+    p[3] = (BYTE)n;
+    VirtualProtect(p + 3, 1, viejo, &viejo);
+    FlushInstructionCache(GetCurrentProcess(), p + 3, 1);
+    l_ini(&l); l_s(&l, "[bucle] pasos sin dibujar como mucho: "); l_u(&l, n); l_s(&l, " (de 10)"); l_fin(&l);
+}
+
 static NOINL void ventana_instalar(void) {
     char v[8];
     Linea l;
@@ -1011,6 +1035,7 @@ static NOINL void iniciar(void) {
     if (g_vmodo != VW_ORIG) ventana_instalar();
     cargadores_instalar();   /* opcional: menos hilos de carga de texturas (navegador) */
     saltar_intro();          /* opcional: YO2ONLINE_SKIPINTRO (pruebas) */
+    max_saltos();            /* opcional: YO2ONLINE_MAXSKIP (navegador) */
     /* Tambien sin ventana ampliada: en el navegador (Boxedwine, escritorio de 1024x768) la ventana con marco no cabe y el
      * area cliente se queda en 1018x736; asi el raton del juego coincide con la pantalla. («fullscreen = 1» en system.bin
      * cuelga el cliente en Boxedwine antes de dibujar nada.) */

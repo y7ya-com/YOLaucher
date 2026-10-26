@@ -168,6 +168,7 @@ mismatch; `yo2.exe` on disk is never changed. Each is off unless its switch is s
 | `YO2ONLINE_TEXLOADERS=8` | 0x59c8ed, 0x59f3a0 | `81 fe 80 00 00 00` / `81 fa 80 00 00 00` → limit byte `80` → `08` | 8 texture-loader threads instead of 128 (each is a Web Worker) |
 | `YO2ONLINE_SKIPINTRO=1` | 0x6deebd | `6a 02` → `6a 04` | patcher asks for the title instead of the KONAMI logo |
 | `YO2ONLINE_SKIPINTRO=2` | also 0x7fa659 | `6a 05` → `6a 06` | ONLINE opens login directly, skipping the rules page |
+| `YO2ONLINE_MAXSKIP=n` (0-9) | 0x6090b7 | `c7 45 e8 0a 00 00 00` → immediate `0a` → `n` | the game loop (0x607fd0) skips up to 10 renders when its fixed 33 ms logic step falls behind, which is always the case here; with a small n it draws after every n+1 steps (slower game time, more frames) |
 
 ### Status (2026-10-26)
 
@@ -187,6 +188,39 @@ A-lien (Store) goes through rock-paper-scissors, the field, summoning from the h
 - Testing headless: Chrome for Testing with `--headless=new` keeps ANGLE Metal on Apple GPUs and runs at the same
   frame rate as a visible window (a hidden headed window drops to ~1 fps). Drive it over CDP with trusted
   `Input.dispatchMouseEvent`.
+
+### Measured: JIT cache, fast x87, where the time goes (2026-10-26)
+
+Same path every run (title → login → My Room → deck editor), off-screen Chrome, non-JIT build unless stated;
+fps = presented frames.
+
+| screen | multiThreaded | + `boxedwine-x87-fast.patch` |
+|---|---|---|
+| title | 30.1 | 29.0 |
+| character list | 13.1 | 13.6 |
+| My Room (15 s, noisy) | 3.8 | 2.9 |
+| deck editor (140 s) | 1.2 | 1.2 |
+
+- **JIT cache: not worth it.** A recorded and offline-optimised cache (`boxedwine-wasm-jit-cache-pipeline.mjs`;
+  15 s of boot = 6.4k blocks → 42 groups, 65.6 → 21.8 MB of wasm, 1.75 MB zip) makes the JIT build reach 2.5 GB in
+  the page *sooner* (31 s vs 37 s without it). The memory is the JIT's own C++ heap (sbrk 1.28 GB against 0.3 GB of
+  guest RAM at 38 s), not the generated code. Recording longer than ~20 s also hangs "Save JIT Cache" on a lock the
+  page's main thread waits for (`boxedwine-jit-save.patch` has an untested fix, not committed).
+- **Fast x87 is neutral.** `KSystem::useF64` is already on in wasm builds. The patch only replaces softfloat's
+  f64 → extF80 → f32 rounding (D3D's single-precision control word) with the native cast for round-to-nearest. It's
+  bit-identical on 20M inputs (`x87-f32-check.c`, which also catches a wrong rounding mode), but no faster.
+  Optional.
+- **The slow screens are guest-CPU-bound.** At the deck editor the page's main thread is under 20% busy and
+  proxied calls are 0.1%. One guest thread (the game's) is 100% busy in the interpreter. The game runs logic at a
+  fixed 30 Hz and skips up to 10 renders when it falls behind (0x607fd0), so 1.2 fps means each logic step takes
+  ~10× its 33 ms budget. The next lever is game-side: find the hot yo2.exe code there.
+
+## Play it locally
+
+`web/play.sh <client folder or yo2_2008-11_Extracted.7z>` builds everything under `$YO2WEB` (default `~/.yo2web`),
+starts the static server, the gateway and `run.py`, and prints the URL. It's safe to rerun. `web/stop.sh` stops it.
+Tested from a fresh clone. `BW_DIST_URL=<tarball of Build/MultiThreaded>` skips the emscripten build. Hosting for
+other players: [HOSTING.md](HOSTING.md).
 
 ## How to reproduce
 
