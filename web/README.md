@@ -141,8 +141,11 @@ every frame (3 MB at 1024x768) stayed in the GPU process, even when the page clo
   the game use its Full-screen path: client exactly 1024x768, every button lands. `fullscreen = 1` in `system.bin`
   hangs the client before it draws; `resolution=1030x800` breaks D3D device creation (no 1024x768 mode); YOLaucher's
   `YO2ONLINE_WINDOW=fit` is off by 1.5x (Wine reports a DPI-scaled monitor).
-- **The game samples the button once per frame.** A press and release that land in the same frame are lost, so slow
-  frames (debug tracing, a second emulator on the machine) make clicks look random. Hold a click for two frames.
+- **Quick clicks are fine at low fps.** The game reads the button state once per frame (`GetState` 0x542270), which
+  looked like it would lose a press and release inside one 150 ms frame. Measured: 6 of 6 back-to-back CDP
+  down/up clicks with no wait toggled the shop cart at 6 fps, so Wine already hands the down and the up to
+  different polls. No input patch needed. Clicks that seemed "random" earlier were the 1018x736 client offset (above)
+  and clicks on things that only react to walking (below).
 - Wine's fullscreen pointer grab sends events through its hwnd-less clip window; harmless, but
   `[HKCU\Software\Wine\X11 Driver] "GrabFullscreen"="N"` / `"GrabPointer"="N"` keep events on the game window.
 - **You walk by holding the RIGHT mouse button** (not by clicking the floor). `CChibiAvatarCtrl` (0x9c5560) reads
@@ -158,19 +161,20 @@ every frame (3 MB at 1024x768) stayed in the GPU process, even when the page clo
 
 Title → login (account seeded with `make_state.py`) → character select → **My Room** → Edit Deck → walk out →
 gate (English, Beginner's Lobby A) → **lobby rooms** (MOVE between Duel Academy / Store / Duel Space / Slifer Red)
-→ **NPC dialogs** → **NPC duel** all work in the browser. The duel against A-lien (Store) goes through
-rock-paper-scissors, the field, summoning from the hand, phases and the NPC's turns (server `0x6xxx` on port 5760,
-OCGcore on the emulator).
+→ **NPC dialogs** → **NPC duel** → **card shop** (buy and open a pack) all work in the browser. The duel against
+A-lien (Store) goes through rock-paper-scissors, the field, summoning from the hand, phases and the NPC's turns
+(server `0x6xxx` on port 5760, OCGcore on the emulator).
 
 - Entering a lobby room failed with `err:d3d:resource_init Out of adapter memory` (WineD3D's default VRAM estimate
   for WebGL is small). `[HKCU\Software\Wine\Direct3D] "VideoMemorySize"="1024"` fixes it.
 - `YO2ONLINE_SKIPINTRO=2` (hook) skips the logo and the rules page; ONLINE then opens the login dialog.
 - Speed: lobby rooms ~4 fps, duel field similar, deck editor ~1 fps (the game thread waits on main-thread file I/O
   proxies). Playable but slow; the speed patches in this folder are the next lever.
-- Not yet verified in the browser: buying in the shop (the exit is found, see Input).
+- **Shop**: walking onto the CARD SHOP doors opens Sadie's store (REQSHOPITEM 0x5208 → catalogue); buying a
+  200 MP booster sends 0x5210 → 0x5212/0x5211/0x4140 and the pack-opening shows the 5 cards.
 - Testing headless: Chrome for Testing with `--headless=new` keeps ANGLE Metal on Apple GPUs and runs at the same
   frame rate as a visible window (a hidden headed window drops to ~1 fps). Drive it over CDP with trusted
-  `Input.dispatchMouseEvent`, holding each button for two presented frames.
+  `Input.dispatchMouseEvent`.
 
 ## How to reproduce
 
