@@ -169,6 +169,25 @@ mismatch; `yo2.exe` on disk is never changed. Each is off unless its switch is s
 | `YO2ONLINE_SKIPINTRO=1` | 0x6deebd | `6a 02` → `6a 04` | patcher asks for the title instead of the KONAMI logo |
 | `YO2ONLINE_SKIPINTRO=2` | also 0x7fa659 | `6a 05` → `6a 06` | ONLINE opens login directly, skipping the rules page |
 | `YO2ONLINE_MAXSKIP=n` (0-9) | 0x6090b7 | `c7 45 e8 0a 00 00 00` → immediate `0a` → `n` | the game loop (0x607fd0) skips up to 10 renders when its fixed 33 ms logic step falls behind, which is always the case here; with a small n it draws after every n+1 steps (slower game time, more frames) |
+| `YO2ONLINE_FASTSORT=1` | 0x5e1b90, 0x5e1710 | `jmp` to the hook (7-byte trampoline back) | the draw-order std::sort (432 elements in the deck editor, 60 calls/s, 99.9% already sorted) gets an O(n) "already sorted?" check first, and its comparator is replaced by one without the debug z calls and pointer checks |
+| `YO2ONLINE_NOASSERT=1` | 1765 flag bytes in 0x126f000-0x12be000 | `00` → `01` | sets every assert's "already reported" flag, so the checks (task-pointer validation, CTask::Call, ...) are skipped; a real failure no longer reports |
+| `YO2ONLINE_DYNCASTCACHE=1` | 0xb0b20e (`__RTDynamicCast`) | `jmp` to the hook (5-byte trampoline back) | caches the cast result delta per (vftable, VfDelta, src, dst), 4096 entries |
+| `YO2ONLINE_NODEBUG=1` | | | NOASSERT + DYNCASTCACHE |
+| `YO2ONLINE_SORTSTATS=1` | | | with FASTSORT: one `BWSORT` line per second (calls, n, already sorted, on screen) via OutputDebugString (`WINEDEBUG=warn+debugstr`) |
+
+Measured 2026-10-27 in Boxedwine multiThreaded, MAXSKIP=1, each variant run right after its control (fps, presented
+frames; deck editor = 100 s after opening it):
+
+| Variant | My Room ctl → var | Deck editor ctl → var |
+|---|---|---|
+| FASTSORT | 2.9 → 3.7 | 3.8 → 4.9 (+29%) |
+| FASTSORT + SORTSTATS | 2.7 → 3.6 | 3.6 → 4.8 |
+| FASTSORT + NOASSERT | 2.5 → 3.4 | 3.3 → 4.9 |
+| FASTSORT + NODEBUG | 2.5 → 4.0 | 3.7 → 5.2 (+41%) |
+
+FASTSORT is the proven win. NOASSERT/NODEBUG on top of it adds about 0.3 fps, which is inside run-to-run noise, and
+DYNCASTCACHE alone was never measured. Culling by screen position wouldn't help: 428 of the 432 sorted elements are
+on screen.
 
 ### Status (2026-10-26)
 

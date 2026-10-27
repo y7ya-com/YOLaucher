@@ -13,6 +13,9 @@
  *   YO2ONLINE_TEXLOADERS=<n> solo navegador (Boxedwine): n hilos de carga de texturas en vez de 128 (ver cargadores_instalar)
  *   YO2ONLINE_SKIPINTRO=1|2  pruebas: 1 = sin logo KONAMI, 2 = ademas sin la pantalla de normas (ver saltar_intro)
  *   YO2ONLINE_MAXSKIP=<n>    solo navegador: como mucho n pasos de logica sin dibujar (el juego trae 10; ver max_saltos)
+ *   YO2ONLINE_FASTSORT=1     solo navegador: orden de dibujado sin validaciones de depuracion y sin reordenar lo ya ordenado (ver orden_rapido)
+ *   YO2ONLINE_SORTSTATS=1    diagnostico (con FASTSORT): estadisticas de esa ordenacion una vez por segundo en la salida estandar
+ *   YO2ONLINE_NODEBUG=1      solo navegador: NOASSERT + DYNCASTCACHE (cada uno tambien suelto con =1; ver sin_asserts, dyncast_cache)
  *
  * Por que version.dll: yo2.exe la importa (GetFileVersionInfoA/SizeA, VerQueryValueA), no es una KnownDLL (Windows la
  * busca primero en la carpeta del exe) y tiene solo 17 exportaciones. winmm.dll NO: es la del mod offline de derplayer
@@ -938,6 +941,181 @@ static NOINL void max_saltos(void) {
     l_ini(&l); l_s(&l, "[bucle] pasos sin dibujar como mucho: "); l_u(&l, n); l_s(&l, " (de 10)"); l_fin(&l);
 }
 
+/* YO2ONLINE_FASTSORT=1. El orden de dibujado de los sprites (std::sort en FUN_005e1b90 sobre el vector [+4, +8) de una
+ * escena) usa el comparador FUN_005e1710 (stdcall, ret 8): devuelve z(b) < z(a) con z = metodo virtual +0x20, pero antes
+ * llama a z dos veces sin usar el resultado, valida los dos punteros de tarea (FUN_0062a420: patrones 0xCDCDCDCD /
+ * 0xFEEEFEEE / 0xBAADF00D y la guarda +0x38) y monta un marco SEH. En el editor de mazos la ordenacion con sus ayudantes
+ * se lleva ~28% del hilo del juego, y la lista suele llegar ya ordenada de la vuelta anterior.
+ *   - 0x5e1710: salto a comparar_z, el mismo resultado con una llamada a z por elemento y nada mas.
+ *   - 0x5e1b90: salto a ordenar_si_hace_falta, que recorre la lista una vez y solo llama al sort original (trampolin con
+ *     sus 7 primeros bytes) si algun par esta desordenado. Los empates conservan el orden que ya tenian. */
+typedef float(__attribute__((thiscall)) *z_t)(void *);
+typedef void(__attribute__((thiscall)) *ordenar_t)(void *);
+static ordenar_t g_ordenar_original;
+static float z_de(void *e) { return (*(z_t *)(*(BYTE **)e + 0x20))(e); }
+static BYTE __attribute__((stdcall)) comparar_z(void *a, void *b) { float za = z_de(a); return z_de(b) < za; }
+/* YO2ONLINE_SORTSTATS=1 (diagnostico): una linea por segundo en la salida estandar (la consola del navegador) con las
+ * ordenaciones de ese segundo (y por OutputDebugString, visible con WINEDEBUG=warn+debugstr): cuantas, n medio y maximo, cuantas ya venian ordenadas, y cuantos elementos tenian su
+ * posicion (+0x110, +0x114; z es +0x118) dentro de la pantalla de 1024x768. */
+static int g_sortstats;
+static struct { DWORD t0, llamadas, ya_ordenadas, n, n_max, en_pantalla; } g_ss;
+static void sortstats_contar(void **p, void **fin, int ordenada) {
+    DWORD n = (DWORD)(fin - p), ahora = GetTickCount();
+    g_ss.llamadas++; g_ss.n += n; if (n > g_ss.n_max) g_ss.n_max = n; if (ordenada) g_ss.ya_ordenadas++;
+    for (; p != fin; p++) {
+        float x = *(float *)((BYTE *)*p + 0x110), y = *(float *)((BYTE *)*p + 0x114);
+        if (x > -64 && x < 1088 && y > -64 && y < 832) g_ss.en_pantalla++;
+    }
+    if (ahora - g_ss.t0 >= 1000) {
+        Linea l;
+        DWORD w;
+        HANDLE o = GetStdHandle(STD_OUTPUT_HANDLE);
+        l_ini(&l); l_s(&l, "BWSORT llamadas="); l_u(&l, g_ss.llamadas); l_s(&l, " n_medio=");
+        l_u(&l, g_ss.llamadas ? g_ss.n / g_ss.llamadas : 0); l_s(&l, " n_max="); l_u(&l, g_ss.n_max);
+        l_s(&l, " ya_ordenadas="); l_u(&l, g_ss.ya_ordenadas); l_s(&l, " en_pantalla_medio=");
+        l_u(&l, g_ss.llamadas ? g_ss.en_pantalla / g_ss.llamadas : 0);
+        l.b[l.n++] = '\r'; l.b[l.n++] = '\n';
+        if (o && o != INVALID_HANDLE_VALUE) WriteFile(o, l.b, (DWORD)l.n, &w, NULL);
+        l.b[l.n] = 0;
+        OutputDebugStringA(l.b);   /* sale en la consola con WINEDEBUG=warn+debugstr */
+        g_ss.t0 = ahora; g_ss.llamadas = g_ss.ya_ordenadas = g_ss.n = g_ss.n_max = g_ss.en_pantalla = 0;
+    }
+}
+static void __attribute__((thiscall)) ordenar_si_hace_falta(void *v) {
+    void **ini = *(void ***)((BYTE *)v + 4), **p = ini, **fin = *(void ***)((BYTE *)v + 8);
+    float antes, z;
+    if (p == fin) return;
+    antes = z_de(*p);
+    for (p++; p != fin; p++) {
+        z = z_de(*p);
+        if (antes < z) {   /* comparar_z(p[i], p[i-1]): desordenado */
+            if (g_sortstats) sortstats_contar(ini, fin, 0);
+            g_ordenar_original(v); return;
+        }
+        antes = z;
+    }
+    if (g_sortstats) sortstats_contar(ini, fin, 1);
+}
+static int saltar_a(BYTE *en, const void *destino, const BYTE *esperado, unsigned n) {
+    DWORD viejo;
+    unsigned j;
+    if (!legible(en, n)) return 0;
+    for (j = 0; j < n; j++) if (en[j] != esperado[j]) return 0;
+    if (!VirtualProtect(en, 5, PAGE_EXECUTE_READWRITE, &viejo)) return 0;
+    en[0] = 0xe9; pon32(en + 1, (DWORD)((UINT_PTR)destino - (UINT_PTR)(en + 5)));
+    VirtualProtect(en, 5, viejo, &viejo);
+    FlushInstructionCache(GetCurrentProcess(), en, 5);
+    return 1;
+}
+static NOINL void orden_rapido(void) {
+    static const BYTE cmp_esperado[13] = {0x64, 0xa1, 0x00, 0x00, 0x00, 0x00, 0x6a, 0xff, 0x68, 0x10, 0x6b, 0xb9, 0x00};
+    static const BYTE sort_esperado[7] = {0x83, 0xec, 0x10, 0x53, 0x8b, 0x59, 0x04};   /* sub esp,10 / push ebx / mov ebx,[ecx+4] */
+    BYTE *t, *sort = A(0x005e1b90), *cmp = A(0x005e1710);
+    DWORD viejo;
+    unsigned k = 0, j;
+    if (leer_uint_env("YO2ONLINE_FASTSORT") != 1) return;
+    g_sortstats = leer_uint_env("YO2ONLINE_SORTSTATS") == 1;
+    if (!legible(sort, 7) || !legible(cmp, 13)) return;
+    for (j = 0; j < 7; j++) if (sort[j] != sort_esperado[j]) { log1("[orden] bytes inesperados en 0x5e1b90; no se toca", ""); return; }
+    for (j = 0; j < 13; j++) if (cmp[j] != cmp_esperado[j]) { log1("[orden] bytes inesperados en 0x5e1710; no se toca", ""); return; }
+    t = (BYTE *)VirtualAlloc(NULL, 16, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!t) return;
+    for (j = 0; j < 7; j++) t[k++] = sort_esperado[j];
+    t[k++] = 0xe9; pon32(t + k, (DWORD)((UINT_PTR)(sort + 7) - (UINT_PTR)(t + k + 4))); k += 4;   /* jmp 0x5e1b97 */
+    VirtualProtect(t, 16, PAGE_EXECUTE_READ, &viejo);
+    FlushInstructionCache(GetCurrentProcess(), t, 16);
+    g_ordenar_original = (ordenar_t)t;
+    if (!saltar_a(cmp, comparar_z, cmp_esperado, 13) || !saltar_a(sort, ordenar_si_hace_falta, sort_esperado, 7)) {
+        log1("[orden] error al enganchar", ""); return;
+    }
+    log1("[orden] comparador de z sin validaciones; sort solo si la lista esta desordenada", "");
+}
+
+/* YO2ONLINE_NOASSERT=1 (o NODEBUG=1). Las comprobaciones de depuracion del juego son todas
+ *     if (bandera == 0 && comprobacion_falla) { if (!informar(&bandera, texto, fichero, linea)) abort(); }
+ * con informar = FUN_0060cff0 (o su thunk 0x410514) y una bandera de un byte por comprobacion, a 0 en el ejecutable y
+ * que el juego solo lee. Con la bandera a 1 la condicion se corta antes de evaluar la comprobacion (validar punteros de
+ * tarea con FUN_0062a420, CTask::Call en 0x627eb0/0x628210, etc.). Las banderas se sacan del propio codigo: cada
+ * `push offset bandera` (68 imm32, en 0x126f000-0x12be000) seguido en menos de 17 bytes de un call a informar.
+ * En 080912 salen 1765 banderas de 9589 llamadas; un fallo real ya no avisa (el juego puede caerse despues). */
+static NOINL void sin_asserts(void) {
+    BYTE *c = A(0x00401000), *b;
+    const DWORD tam = 0x7e30d3;
+    DWORD i, q, n = 0, viejo;
+    Linea l;
+    if (leer_uint_env("YO2ONLINE_NOASSERT") != 1 && leer_uint_env("YO2ONLINE_NODEBUG") != 1) return;
+    if (!legible(c, tam) || !legible(A(0x0126f000), 0x4f000)) return;
+    for (i = 0; i + 25 < tam; i++) {
+        DWORD v;
+        if (c[i] != 0x68) continue;
+        v = (DWORD)c[i + 1] | (DWORD)c[i + 2] << 8 | (DWORD)c[i + 3] << 16 | (DWORD)c[i + 4] << 24;
+        if (v < 0x0126f000 || v >= 0x012be000) continue;
+        for (q = i + 5; q < i + 22; q++) {
+            DWORD destino;
+            if (c[q] != 0xe8) continue;
+            destino = 0x00401000 + q + 5 + (c[q + 1] | c[q + 2] << 8 | c[q + 3] << 16 | (DWORD)c[q + 4] << 24);
+            if (destino != 0x00410514 && destino != 0x0060cff0) continue;
+            b = A(v);
+            if (*b == 0) {
+                if (!VirtualProtect(b, 1, PAGE_READWRITE, &viejo)) break;
+                *b = 1; n++;
+                VirtualProtect(b, 1, viejo, &viejo);
+            }
+            break;
+        }
+    }
+    l_ini(&l); l_s(&l, "[asserts] comprobaciones de depuracion desactivadas: "); l_u(&l, n); l_fin(&l);
+}
+
+/* YO2ONLINE_DYNCASTCACHE=1 (o NODEBUG=1). __RTDynamicCast (0xb0b20e, cdecl: objeto, VfDelta, tipo origen, tipo destino,
+ * es_referencia) se lleva ~6% del hilo del juego: los accesores de tareas hacen dynamic_cast<CElement*> y similares en
+ * cada uso. El resultado solo depende del vftable del subobjeto (que fija el tipo completo y la posicion del subobjeto),
+ * de VfDelta y de los dos tipos, asi que se guarda el desplazamiento (o "nulo") en una tabla y solo la primera vez se
+ * llama al original (trampolin con sus 5 primeros bytes). Un objeto nulo sigue dando nulo; un fallo con es_referencia
+ * sigue yendo al original para que lance bad_cast. */
+typedef void *(__attribute__((cdecl)) *dyncast_t)(void *, long, void *, void *, int);
+static dyncast_t g_dyncast_original;
+#define DC_N 4096
+#define DC_NULO ((long)0x7fffffff)
+static struct { void *volatile vf; void *origen, *destino; long vfdelta, delta; } g_dc[DC_N];
+static void *__attribute__((cdecl)) dyncast_cache(void *obj, long vfdelta, void *origen, void *destino, int ref) {
+    void *vf, *r;
+    unsigned h;
+    long delta;
+    if (!obj) return 0;
+    vf = *(void **)obj;
+    h = (unsigned)(((UINT_PTR)vf >> 3) ^ ((UINT_PTR)origen >> 2) ^ ((UINT_PTR)destino << 1) ^ (unsigned)vfdelta) & (DC_N - 1);
+    if (g_dc[h].vf == vf && g_dc[h].origen == origen && g_dc[h].destino == destino && g_dc[h].vfdelta == vfdelta) {
+        delta = g_dc[h].delta;
+        if (g_dc[h].vf == vf) {   /* otro hilo no la ha cambiado mientras se leia */
+            if (delta != DC_NULO) return (BYTE *)obj + delta;
+            if (!ref) return 0;
+        }
+    }
+    r = g_dyncast_original(obj, vfdelta, origen, destino, ref);
+    g_dc[h].vf = 0;
+    g_dc[h].origen = origen; g_dc[h].destino = destino; g_dc[h].vfdelta = vfdelta;
+    g_dc[h].delta = r ? (long)((BYTE *)r - (BYTE *)obj) : DC_NULO;
+    g_dc[h].vf = vf;
+    return r;
+}
+static NOINL void dyncast_instalar(void) {
+    static const BYTE esperado[13] = {0x55, 0x8b, 0xec, 0x6a, 0xff, 0x68, 0x40, 0x48, 0xbf, 0x00, 0x68, 0xf0, 0x0a};
+    BYTE *f = A(0x00b0b20e), *t;
+    DWORD viejo;
+    unsigned j, k = 0;
+    if (leer_uint_env("YO2ONLINE_DYNCASTCACHE") != 1 && leer_uint_env("YO2ONLINE_NODEBUG") != 1) return;
+    t = (BYTE *)VirtualAlloc(NULL, 16, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!t) return;
+    for (j = 0; j < 5; j++) t[k++] = esperado[j];                       /* push ebp / mov ebp,esp / push -1 */
+    t[k++] = 0xe9; pon32(t + k, (DWORD)((UINT_PTR)(f + 5) - (UINT_PTR)(t + k + 4))); k += 4;
+    VirtualProtect(t, 16, PAGE_EXECUTE_READ, &viejo);
+    FlushInstructionCache(GetCurrentProcess(), t, 16);
+    g_dyncast_original = (dyncast_t)t;
+    if (!saltar_a(f, dyncast_cache, esperado, 13)) { log1("[dyncast] bytes inesperados en 0xb0b20e; no se toca", ""); return; }
+    log1("[dyncast] __RTDynamicCast con cache", "");
+}
+
 static NOINL void ventana_instalar(void) {
     char v[8];
     Linea l;
@@ -1036,6 +1214,9 @@ static NOINL void iniciar(void) {
     cargadores_instalar();   /* opcional: menos hilos de carga de texturas (navegador) */
     saltar_intro();          /* opcional: YO2ONLINE_SKIPINTRO (pruebas) */
     max_saltos();            /* opcional: YO2ONLINE_MAXSKIP (navegador) */
+    orden_rapido();          /* opcional: YO2ONLINE_FASTSORT (navegador) */
+    sin_asserts();           /* opcional: YO2ONLINE_NOASSERT / NODEBUG (navegador) */
+    dyncast_instalar();      /* opcional: YO2ONLINE_DYNCASTCACHE / NODEBUG (navegador) */
     /* Tambien sin ventana ampliada: en el navegador (Boxedwine, escritorio de 1024x768) la ventana con marco no cabe y el
      * area cliente se queda en 1018x736; asi el raton del juego coincide con la pantalla. («fullscreen = 1» en system.bin
      * cuelga el cliente en Boxedwine antes de dibujar nada.) */
