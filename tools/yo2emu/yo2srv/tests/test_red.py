@@ -89,7 +89,7 @@ class TestConn(unittest.TestCase):
         self.c.send(0x2002, b"ab", pause=0)
         self.c.send(0x2004, b"", pause=0)
         self.assertEqual(leer(self.b, 2), [(0x2002, 1, b"ab"), (0x2004, 2, b"")])
-        self.assertNotIn((self.c.peer, 5732), conexion.Conn.GATE_SEQ, "el lobby no sigue la cuenta entre conexiones")
+        self.assertNotIn((self.c.peer, 5732), conexion.Conn.GATE_SEQ, "sin mensaje del cliente no se guarda cuenta")
         self.c.saw_client(1)                                                    # el cliente vuelve a empezar desde #1
         self.c.send(0x2004, b"", pause=0)
         self.assertEqual(leer(self.b), [(0x2004, 1, b"")])
@@ -224,6 +224,18 @@ class TestMismaIP(unittest.TestCase):
         self.manda(a2, 1)
         self.assertEqual(leer(ra2), [(0x0004, 4, b"")])
         self.assertEqual([p for _, p, _ in leer(rb1, 5)], [1, 2, 3, 4, 5])
+
+    def test_cuentas_sigue_la_cuenta_al_volver_a_entrar(self):
+        """27-10: Return to Title y otra vez login en el mismo proceso: la conexión de cuentas nueva llega con 0x3001 #29
+        (sin sesión aún) y esperaba #N+1; con el contador por conexión le llegaba #1 y se quedaba cargando."""
+        c1, r1 = self.conn(5731)
+        c1.saw_client(1); self.manda(c1, 1)                      # 0x3001 -> 0x3002
+        c1.sess = types.SimpleNamespace(acct="A")                # 0x3003: ya tiene sesión
+        c1.saw_client(2); self.manda(c1, 5)
+        c2, r2 = self.conn(5731)
+        c2.saw_client(3)                                         # el cliente sigue su cuenta; el servidor, la suya
+        self.manda(c2, 1)
+        self.assertEqual(leer(r2), [(0x0004, 7, b"")])
 
     def test_puerta_sigue_la_cuenta_entre_conexiones(self):
         g1, r1 = self.conn(5730)

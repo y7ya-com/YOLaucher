@@ -2,7 +2,7 @@
 
 Es la clase de run.py de siempre, SIN cambiar la lógica: el cliente exige que los mensajes que recibe vayan numerados
 1, 2, 3... (campo «parámetro» de la cabecera) y procesa uno por fotograma, así que se mandan en cola y con pausa. La
-numeración de la PUERTA y del DUELO sobrevive a las reconexiones de un mismo cliente en `Conn.GATE_SEQ` (el MISMO dict
+numeración sobrevive a las reconexiones de un mismo cliente que siguen su cuenta en `Conn.GATE_SEQ` (el MISMO dict
 que antes: lo usan los hot_*.py y las pruebas por `Conn.GATE_SEQ`), por cliente y no por IP (26-10: ver `seq`).
 
 Lo que cambia es de dónde sale cada nombre externo (regla de oro de §2.3): `log`, `current_conn` (la reasignan las
@@ -35,8 +35,8 @@ class Conn:
     # número no es contador + 1). En el log, toda conexión de cuentas, lobby, sala o duelo empieza en #1; solo la
     # puerta (5730) sigue la cuenta entre conexiones del mismo cliente (#3, #5... en la 2.ª y 3.ª). Antes era un
     # contador por PUERTO compartido por todos: con dos clientes, cada envío a uno desfasaba al otro para siempre.
-    # Ahora: contador propio de cada conexión, y en la puerta y el duelo uno por cliente (GATE_SEQ, ver `seq`). Se
-    # reinicia cuando el cliente vuelve a empezar desde #1 (cliente reiniciado).
+    # Ahora: contador propio de cada conexión, y la que llega con el número del cliente seguido continúa la de ese
+    # cliente (GATE_SEQ, ver `seq`). Se reinicia cuando el cliente vuelve a empezar desde #1.
     GATE_SEQ = {}
     MAX_DATA = 1024   # B04: FUN_00689ea0 -> si el largo > 0x400, estado 0xff y el flujo queda desalineado para siempre
     def __init__(self, sock, port):
@@ -54,15 +54,14 @@ class Conn:
             self.peer = "?"
     # 2026-10-06, en vivo: el 2.º duelo se colgaba. La conexión de duelo NUEVA llega con el número del cliente seguido
     # (0x6001 #25) y espera que el servidor también siga su cuenta en ese puerto; con el contador por conexión le
-    # llegaba #1 y lo tiraba (FUN_0068bac0). Igual en la puerta. Solo esos dos puertos siguen la cuenta entre conexiones;
-    # lobby, salas y cuentas empiezan en #1 y llevan su contador propio (self._seq).
+    # llegaba #1 y lo tiraba (FUN_0068bac0). Igual en la puerta, y en cuentas al volver a entrar desde el título en el
+    # MISMO proceso (0x3001 #29, 27-10). Regla, en todos los puertos: una conexión que empieza en #1 lleva su contador
+    # propio (self._seq); una que empieza más adelante sigue la cuenta que el cliente dejó en ese puerto.
     # 26-10 (web): antes el contador de TODOS los puertos era uno por (IP, puerto). En la web pública todos los jugadores
     # llegan por la pasarela desde 127.0.0.1: compartían número, y cada aviso a uno (0x3112, 0x4181) desfasaba al otro,
     # que tiraba en silencio lo siguiente (el que entraba en un bloque ocupado se quedaba en My Room). Ahora la cuenta
     # que sobrevive va por (cuenta o IP, puerto, número del siguiente mensaje del cliente): dos clientes tras la misma IP
     # no se pisan. La clave (cuenta o IP, puerto) queda como respaldo (lo de antes) si no hay otra.
-    def _keeps_count(self):
-        return self.port in (getattr(srv, "GATE_PORT", None), getattr(srv, "DUEL_PORT", None))
     def _who(self):
         return getattr(getattr(self, "sess", None), "acct", None) or self.peer
     @property
@@ -78,20 +77,22 @@ class Conn:
         self._keep()
     def _keep(self):
         last = getattr(self, "_last", None)
-        if last is None or not self._keeps_count():
+        if last is None:
             return
-        old, k = getattr(self, "_kept", None), (self._who(), self.port, last + 1)
-        if old is not None and old != k:
-            Conn.GATE_SEQ.pop(old, None)
-        Conn.GATE_SEQ[k] = Conn.GATE_SEQ[(self._who(), self.port)] = self._seq
-        self._kept = k
+        # por la cuenta y también por la IP: la 1.ª conexión de cuentas o lobby al volver a entrar aún no tiene sesión
+        keys = {(w, self.port, last + 1) for w in (self._who(), self.peer)}
+        for k in (getattr(self, "_kept", None) or set()) - keys:
+            Conn.GATE_SEQ.pop(k, None)
+        for w in (self._who(), self.peer):
+            Conn.GATE_SEQ[(w, self.port, last + 1)] = Conn.GATE_SEQ[(w, self.port)] = self._seq
+        self._kept = keys
     def saw_client(self, param):
         # 07-10 (−242, research/cuentas/NOTES.md §6): hora del último mensaje del cliente por esta conexión. Lo llama
         # _handle con CADA mensaje (también los lectores de antes de una carga en caliente: es un método de la clase).
         self.rx_t = time.time()
         if param == 1:
             self._seq, self._pend = 0, None
-        elif getattr(self, "_last", None) is None and self._keeps_count():   # 1.er mensaje: sigue la cuenta del cliente
+        elif getattr(self, "_last", None) is None:   # 1.er mensaje y no es #1: sigue la cuenta del cliente
             if self.port == getattr(srv, "DUEL_PORT", None) and not getattr(getattr(self, "sess", None), "acct", None):
                 self._pend = param               # la cuenta llega con el 0x6001 (attach): se mira al contestar
             else:
