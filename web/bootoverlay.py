@@ -1,6 +1,6 @@
 """Build overlay.zip: the web filesystem's Wine prefix registry with yo2's settings baked in, for faster boots.
 
-    python3 web/bootoverlay.py site/boxedwine.zip site/overlay.zip [--keep SERVICE ...]
+    python3 web/bootoverlay.py site/boxedwine.zip site/overlay.zip [--d3d8 d3d8.dll] [--keep SERVICE ...]
     URL: ...&overlay=overlay.zip      (Boxedwine puts overlay zips ahead of the root zip, so these .reg files win)
 
 What it changes in home/username/.wine/{system,user}.reg (the prefix in the zip is already initialised, so Wine never
@@ -10,6 +10,8 @@ rebuilds it; the boot cost is the services wineboot starts and start.bat's reged
 - system.reg: services the game never uses set to Start=4 (disabled): Eventlog (svchost), PlugPlay (plugplay.exe and
   the WinePlugPlay drivers winebus/winehid/winebth; winebth fails anyway). Kept: MountMgr (drives), NDIS/nsiproxy
   (networking). --keep PlugPlay keeps one.
+- --d3d8 <dll>: that DLL (the native-D3D8 shim, tools/yo2emu/launcher/juego/dll/d3d8nativo.c) as drive_c/webgl/d3d8.dll.
+  Boxedwine's web build links system32's d3d8.dll to that path and already sets d3d8=n,b, so nothing else changes.
 """
 import re
 import sys
@@ -33,7 +35,7 @@ def set_values(reg, key, values):
     return reg[:head.end()] + body.lstrip("\n") + reg[end:]
 
 
-def build(root_zip, out_zip, keep=()):
+def build(root_zip, out_zip, keep=(), d3d8=None):
     z = zipfile.ZipFile(root_zip)
     system = z.read(PREFIX + "system.reg").decode("latin1")
     user = z.read(PREFIX + "user.reg").decode("latin1")
@@ -44,6 +46,8 @@ def build(root_zip, out_zip, keep=()):
     with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED) as o:
         o.writestr(PREFIX + "system.reg", system.encode("latin1"))
         o.writestr(PREFIX + "user.reg", user.encode("latin1"))
+        if d3d8:
+            o.write(d3d8, PREFIX + "drive_c/webgl/d3d8.dll")
     return system, user
 
 
@@ -51,5 +55,10 @@ if __name__ == "__main__":
     t = set_values('[A\\\\B] 1\n#time=1\n"Start"=dword:00000002\n\n[C] 2\n', r"A\\B", {"Start": "dword:00000004", "x": '""'})
     assert t == '[A\\\\B] 1\n#time=1\n"Start"=dword:00000004\n"x"=""\n\n[C] 2\n', t
     args = sys.argv[1:]
+    d3d8 = None
+    if "--d3d8" in args:
+        i = args.index("--d3d8")
+        d3d8 = args.pop(i + 1)
+        args.pop(i)
     keep = args[args.index("--keep") + 1:] if "--keep" in args else []
-    build(args[0], args[1], keep)
+    build(args[0], args[1], keep, d3d8)

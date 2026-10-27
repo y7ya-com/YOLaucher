@@ -300,6 +300,55 @@ Where the deck editor's time goes under the JIT:
 So the next JIT levers would be: compiling LOCK ops, chaining blocks inside a group directly, and evicting cold
 groups.
 
+### Native Direct3D 8 (2026-10-27)
+
+Every sprite the game draws is one `DrawPrimitiveUP` of 4 vertices, and with Wine each one went through `d3d8.dll`
+→ `wined3d` → `opengl32`, all emulated. [`boxedwine-d3d8native.patch`](boxedwine-d3d8native.patch) (on Boxedwine
+2dbabfc, independent of the other patches) and a 4.6 KB guest DLL
+([`d3d8nativo.c`](../tools/yo2emu/launcher/juego/dll/d3d8nativo.c)) replace that chain:
+
+- The guest `d3d8.dll` implements nothing. `Direct3DCreate8` reserves an arena (up to 1 GB; Boxedwine only backs pages
+  that get touched) and calls into Boxedwine, which writes the COM vtables there. Each vtable slot is a 16-byte thunk
+  `int 0x99; .long 0x0D3D0000|interface<<8|slot; ret N`: the same trap Boxedwine's own `opengl32` uses, so a D3D call
+  costs one emulated instruction. Arguments are read off the guest stack and the result goes back in `eax`.
+- Only two slots are guest code: `CreateDevice` makes a WGL context on the game window first (Boxedwine turns it into
+  a WebGL2 context on the game's thread), and `Present` calls `SwapBuffers` after the native side has blitted the back
+  buffer, so presenting uses the existing path.
+- Native side (`source/opengl/d3d8native.cpp`): the fixed-function subset a 2D game needs (XYZ|DIFFUSE|TEX1
+  triangles, texture stage 0, lighting without lights, `A8R8G8B8`/`X8R8G8B8`, render-target textures, D3DX's helper
+  calls). The world matrix and lighting are applied on the CPU when a sprite is queued, so consecutive sprites with
+  the same texture and state go out as one `glDrawArrays`. Texture pixels live in the arena (so `LockRect` gives the
+  game a pointer of its own) and are uploaded lazily from the thread that owns the context; the 8 texture-loader
+  threads never touch GL. BGRA is uploaded as is and swizzled in the shader. Unsupported methods log
+  `d3dnative: unsupported X::Y` once and fail; a stats line every 300 frames gives calls per frame for each method.
+- Use it: build Boxedwine with the patch, then
+  `python3 web/bootoverlay.py site/boxedwine.zip site/gfx-overlay.zip --d3d8 d3d8.dll` and add
+  `&overlay=gfx-overlay.zip`. Boxedwine's web build links `system32\d3d8.dll` to `C:\webgl\d3d8.dll` and already sets
+  `d3d8=n,b`, so the overlay only replaces that file. Without the overlay the same build runs Wine's D3D as before.
+  Without the patch, the guest DLL's first `int 0x99` stops the emulator, so never ship the DLL alone.
+
+Measured on the same wasm (non-JIT `multiThreaded`, headless Chrome for Testing), with and without the overlay;
+presented frames per second:
+
+| screen | Wine d3d8 | native d3d8 | sprites per frame (GL draws) |
+|---|---|---|---|
+| title | 28–30 | 28–30 | 83 (15) |
+| My Room | 25–28 | 26–30 | 42 (28) |
+| lobby: Beginner's Lobby A, Store[2] | 3.4–4.6 | 29.1–29.6 | 325 (149) |
+| NPC duel (A-lien): RPS, field | ~4 (see below) | 29.9–30.0 | 700 (91) |
+| deck editor | 1.2 | 1.4 | 593 (227) |
+
+- 30 fps is the game's own cap: its loop runs logic at a fixed 30 Hz. So the lobby and the duel go from ~4 fps to
+  the cap (about 7x), and the title and My Room were already there.
+- The Wine duel figure is the earlier "duel field similar" (to the lobby) from this README: the scripted Wine run
+  walks by holding the button for a fixed time, so at 4 fps the avatar stopped short of A-lien and the duel didn't
+  start.
+- **Correct:** full-size PNGs of the same screens agree with Wine's output. The deck editor has 99.0% identical
+  pixels and 100% within 8 levels. The title has 94.8% / 99.0%, My Room 96.4% / 97.5%. The character list differs only
+  in its rotating logo ring. The NPC dialog, RPS, the duel field and the hand all render.
+- **The deck editor is not graphics-bound.** It draws 593 sprites per frame either way, and it stays at ~1.4 fps:
+  the time is in the game's logic steps (up to 10 per rendered frame), not in Direct3D.
+
 ### Coverage trace (debug only)
 
 `boxedwine-trace.patch` (on top of `boxedwine-yo2.patch`) records which of the game's code runs. With `&trace=1` in

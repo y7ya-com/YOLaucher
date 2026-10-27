@@ -1,0 +1,1322 @@
+diff --git a/source/opengl/d3d8native.cpp b/source/opengl/d3d8native.cpp
+new file mode 100644
+index 00000000..01287170
+--- /dev/null
++++ b/source/opengl/d3d8native.cpp
+@@ -0,0 +1,1298 @@
++/*
++ * Native Direct3D 8 for a thin guest d3d8.dll (YO2 Online's d3d8 shim).
++ *
++ * The guest's COM vtable slots are 16-byte thunks `int 0x99; .long 0x0D3D0000 | iface << 8 | slot; ret N` written
++ * into a guest arena by d3dInit, so every D3D8 call costs one interpreted instruction instead of a trip through
++ * Wine's d3d8 -> wined3d -> opengl32. Arguments are read off the guest stack (peek32(1) = this), results go to EAX.
++ *
++ * Scope: the fixed-function subset a 2D sprite game uses (XYZ|DIFFUSE|TEX1 triangles, texture stage 0, lighting
++ * without lights, A8R8G8B8/X8R8G8B8 textures, render-target textures). Anything else logs once and fails.
++ *
++ * Conventions:
++ * - Guest objects are 8 bytes in the arena: [vtable][handle]. The handle indexes `objs`.
++ * - Texture pixels (the managed "shadow") live in the arena so LockRect can hand the guest a pointer. Uploads are
++ *   lazy and happen on the thread that owns the WebGL context (the one that created the device); texture-loader
++ *   threads only touch guest memory.
++ * - World transform and lighting are applied on the CPU when a primitive is queued, so consecutive sprites with the
++ *   same texture and render state go out as one glDrawArrays.
++ * - Every render target, the back buffer included, is an FBO stored top row first (the vertex shader flips y);
++ *   Present blits the back buffer to the default framebuffer, flipped.
++ */
++#include "boxedwine.h"
++
++#if defined(BOXEDWINE_OPENGL) && defined(__EMSCRIPTEN__)
++#include <GLES3/gl3.h>
++#include <emscripten/html5_webgl.h>
++#include <emscripten.h>
++#include <algorithm>
++#include <cstddef>
++#include <mutex>
++#include <string>
++#include <vector>
++#include <cstring>
++#include <cmath>
++
++void d3dNativeCall(CPU* cpu, U32 index);
++
++namespace {
++
++enum { IF_D3D, IF_DEV, IF_TEX, IF_SURF, IF_COUNT, IF_GLOBAL = 7 };
++struct Method { const char* name; U16 argBytes; };   // argBytes includes `this`
++
++// Generated from mingw-w64's d3d8.h (method order = vtable order).
++const Method kD3D[] = {{"QueryInterface",12}, {"AddRef",4}, {"Release",4}, {"RegisterSoftwareDevice",8}, {"GetAdapterCount",4}, {"GetAdapterIdentifier",16}, {"GetAdapterModeCount",8}, {"EnumAdapterModes",16}, {"GetAdapterDisplayMode",12}, {"CheckDeviceType",24}, {"CheckDeviceFormat",28}, {"CheckDeviceMultiSampleType",24}, {"CheckDepthStencilMatch",24}, {"GetDeviceCaps",16}, {"GetAdapterMonitor",8}, {"CreateDevice",28}};
++const Method kDev[] = {{"QueryInterface",12}, {"AddRef",4}, {"Release",4}, {"TestCooperativeLevel",4}, {"GetAvailableTextureMem",4}, {"ResourceManagerDiscardBytes",8}, {"GetDirect3D",8}, {"GetDeviceCaps",8}, {"GetDisplayMode",8}, {"GetCreationParameters",8}, {"SetCursorProperties",16}, {"SetCursorPosition",16}, {"ShowCursor",8}, {"CreateAdditionalSwapChain",12}, {"Reset",8}, {"Present",20}, {"GetBackBuffer",16}, {"GetRasterStatus",8}, {"SetGammaRamp",12}, {"GetGammaRamp",8}, {"CreateTexture",32}, {"CreateVolumeTexture",36}, {"CreateCubeTexture",28}, {"CreateVertexBuffer",24}, {"CreateIndexBuffer",24}, {"CreateRenderTarget",28}, {"CreateDepthStencilSurface",24}, {"CreateImageSurface",20}, {"CopyRects",24}, {"UpdateTexture",12}, {"GetFrontBuffer",8}, {"SetRenderTarget",12}, {"GetRenderTarget",8}, {"GetDepthStencilSurface",8}, {"BeginScene",4}, {"EndScene",4}, {"Clear",28}, {"SetTransform",12}, {"GetTransform",12}, {"MultiplyTransform",12}, {"SetViewport",8}, {"GetViewport",8}, {"SetMaterial",8}, {"GetMaterial",8}, {"SetLight",12}, {"GetLight",12}, {"LightEnable",12}, {"GetLightEnable",12}, {"SetClipPlane",12}, {"GetClipPlane",12}, {"SetRenderState",12}, {"GetRenderState",12}, {"BeginStateBlock",4}, {"EndStateBlock",8}, {"ApplyStateBlock",8}, {"CaptureStateBlock",8}, {"DeleteStateBlock",8}, {"CreateStateBlock",12}, {"SetClipStatus",8}, {"GetClipStatus",8}, {"GetTexture",12}, {"SetTexture",12}, {"GetTextureStageState",16}, {"SetTextureStageState",16}, {"ValidateDevice",8}, {"GetInfo",16}, {"SetPaletteEntries",12}, {"GetPaletteEntries",12}, {"SetCurrentTexturePalette",8}, {"GetCurrentTexturePalette",8}, {"DrawPrimitive",16}, {"DrawIndexedPrimitive",24}, {"DrawPrimitiveUP",20}, {"DrawIndexedPrimitiveUP",36}, {"ProcessVertices",24}, {"CreateVertexShader",20}, {"SetVertexShader",8}, {"GetVertexShader",8}, {"DeleteVertexShader",8}, {"SetVertexShaderConstant",16}, {"GetVertexShaderConstant",16}, {"GetVertexShaderDeclaration",16}, {"GetVertexShaderFunction",16}, {"SetStreamSource",16}, {"GetStreamSource",16}, {"SetIndices",12}, {"GetIndices",12}, {"CreatePixelShader",12}, {"SetPixelShader",8}, {"GetPixelShader",8}, {"DeletePixelShader",8}, {"SetPixelShaderConstant",16}, {"GetPixelShaderConstant",16}, {"GetPixelShaderFunction",16}, {"DrawRectPatch",16}, {"DrawTriPatch",16}, {"DeletePatch",8}};
++const Method kTex[] = {{"QueryInterface",12}, {"AddRef",4}, {"Release",4}, {"GetDevice",8}, {"SetPrivateData",20}, {"GetPrivateData",16}, {"FreePrivateData",8}, {"SetPriority",8}, {"GetPriority",4}, {"PreLoad",4}, {"GetType",4}, {"SetLOD",8}, {"GetLOD",4}, {"GetLevelCount",4}, {"GetLevelDesc",12}, {"GetSurfaceLevel",12}, {"LockRect",20}, {"UnlockRect",8}, {"AddDirtyRect",8}};
++const Method kSurf[] = {{"QueryInterface",12}, {"AddRef",4}, {"Release",4}, {"GetDevice",8}, {"SetPrivateData",20}, {"GetPrivateData",16}, {"FreePrivateData",8}, {"GetContainer",12}, {"GetDesc",8}, {"LockRect",16}, {"UnlockRect",4}};
++const Method* const kMethods[IF_COUNT] = {kD3D, kDev, kTex, kSurf};
++const U32 kSlots[IF_COUNT] = {16, 97, 19, 11};
++const char* const kIfName[IF_COUNT] = {"IDirect3D8", "IDirect3DDevice8", "IDirect3DTexture8", "IDirect3DSurface8"};
++
++// D3D8 constants used here
++enum : U32 {
++    D3D_OK = 0, D3DERR_INVALIDCALL = 0x8876086C, D3DERR_NOTAVAILABLE = 0x8876086A, D3DERR_OUTOFVIDEOMEMORY = 0x8876017C,
++    E_NOINTERFACE = 0x80004002,
++    FMT_A8R8G8B8 = 21, FMT_X8R8G8B8 = 22, FMT_D16 = 80, FMT_D24S8 = 75, FMT_D24X8 = 77,
++    POOL_DEFAULT = 0, POOL_MANAGED = 1, POOL_SYSTEMMEM = 2,
++    USAGE_RENDERTARGET = 1, USAGE_DEPTHSTENCIL = 2,
++    RTYPE_SURFACE = 1, RTYPE_TEXTURE = 3,
++    LOCK_READONLY = 0x10,
++    TS_VIEW = 2, TS_PROJECTION = 3, TS_WORLD = 256,
++    CLEAR_TARGET = 1, CLEAR_ZBUFFER = 2, CLEAR_STENCIL = 4,
++    FVF_XYZ = 2, FVF_DIFFUSE = 0x40,
++    RS_ZENABLE = 7, RS_FILLMODE = 8, RS_SHADEMODE = 9, RS_ZWRITEENABLE = 14, RS_ALPHATESTENABLE = 15, RS_SRCBLEND = 19,
++    RS_DESTBLEND = 20, RS_CULLMODE = 22, RS_ZFUNC = 23, RS_ALPHAREF = 24, RS_ALPHAFUNC = 25, RS_ALPHABLENDENABLE = 27,
++    RS_TEXTUREFACTOR = 60, RS_LIGHTING = 137, RS_AMBIENT = 139, RS_COLORVERTEX = 141, RS_DIFFUSEMATERIALSOURCE = 145,
++    RS_SPECULARMATERIALSOURCE = 146, RS_AMBIENTMATERIALSOURCE = 147, RS_EMISSIVEMATERIALSOURCE = 148,
++    RS_COLORWRITEENABLE = 168, RS_BLENDOP = 171,
++    TSS_COLOROP = 1, TSS_COLORARG1 = 2, TSS_COLORARG2 = 3, TSS_ALPHAOP = 4, TSS_ALPHAARG1 = 5, TSS_ALPHAARG2 = 6,
++    TSS_ADDRESSU = 13, TSS_ADDRESSV = 14, TSS_MAGFILTER = 16, TSS_MINFILTER = 17, TSS_MIPFILTER = 18,
++    TSS_COLORARG0 = 26, TSS_ALPHAARG0 = 27,
++    TOP_DISABLE = 1, TOP_SELECTARG1 = 2, TOP_MODULATE = 4, TA_DIFFUSE = 0, TA_CURRENT = 1, TA_TEXTURE = 2,
++    CULL_NONE = 1, CULL_CCW = 3, CMP_LESSEQUAL = 4, CMP_ALWAYS = 8, BLEND_ZERO = 1, BLEND_ONE = 2, BLENDOP_ADD = 1,
++    MCS_MATERIAL = 0, MCS_COLOR1 = 1, MCS_COLOR2 = 2, TADDRESS_WRAP = 1, TADDRESS_MIRROR = 2, TEXF_NONE = 0,
++    TEXF_POINT = 1, TEXF_LINEAR = 2,
++};
++
++// Arguments: peek32(1) is `this`, so a method's first argument is A(2).
++#define A(n) cpu->peek32(n)
++CPU* gcpu;   // the CPU of the current call (guest memory accessors below)
++U32 rd(U32 a) { return gcpu->memory->readd(a); }
++void wr(U32 a, U32 v) { gcpu->memory->writed(a, v); }
++float rdf(U32 a) { U32 v = rd(a); float f; memcpy(&f, &v, 4); return f; }
++U32 asU32(float f) { U32 v; memcpy(&v, &f, 4); return v; }
++
++std::recursive_mutex lock;
++
++// ---------------------------------------------------------------- guest arena
++// ponytail: power-of-two size classes, never given back to Wine; coalescing if a long session runs the arena dry
++U32 arenaBase, arenaSize, arenaTop;
++std::vector<U32> freeLists[32];
++int sizeClass(U32 n) { int c = 4; while ((1u << c) < n) c++; return c; }
++U32 galloc(U32 n) {
++    int c = sizeClass(n);
++    U32 p;
++    if (!freeLists[c].empty()) {
++        p = freeLists[c].back();
++        freeLists[c].pop_back();
++        gcpu->memory->memset(p, 0, n);   // fresh arena pages are already zero (and stay unallocated until touched)
++    } else {
++        U32 align = (1u << c) < 4096 ? (1u << c) : 4096;
++        U32 top = (arenaTop + align - 1) & ~(align - 1);
++        if (top + (1u << c) > arenaBase + arenaSize) {
++            kwarn_fmt("d3dnative: arena full (%u MB), %u bytes wanted", arenaSize >> 20, n);
++            return 0;
++        }
++        p = top;
++        arenaTop = top + (1u << c);
++    }
++    return p;
++}
++void gfree(U32 p, U32 n) { if (p) freeLists[sizeClass(n)].push_back(p); }
++U32 thunkAddr(int iface, int slot) { return arenaBase + (iface * 128 + slot) * 16; }
++U32 vtableAddr(int iface) { return arenaBase + 0x2000 + iface * 0x200; }
++
++// ---------------------------------------------------------------- objects
++struct Obj {
++    int iface = 0;
++    U32 guest = 0;   // the guest object [vtable][handle]
++    U32 refs = 1;
++    virtual ~Obj() {}
++};
++std::vector<Obj*> objs(1, nullptr);   // handle 0 = none
++std::vector<U32> freeHandles;
++
++U32 newGuest(Obj* o, int iface) {
++    o->iface = iface;
++    o->guest = galloc(8);
++    if (!o->guest) return 0;
++    U32 h;
++    if (!freeHandles.empty()) { h = freeHandles.back(); freeHandles.pop_back(); objs[h] = o; }
++    else { h = (U32)objs.size(); objs.push_back(o); }
++    wr(o->guest, vtableAddr(iface));
++    wr(o->guest + 4, h);
++    return o->guest;
++}
++Obj* fromGuest(U32 g, int iface) {
++    if (!g) return nullptr;
++    U32 h = rd(g + 4);
++    if (h >= objs.size() || !objs[h] || objs[h]->iface != iface) return nullptr;
++    return objs[h];
++}
++void destroyGuest(Obj* o) {
++    U32 h = rd(o->guest + 4);
++    if (h < objs.size() && objs[h] == o) { objs[h] = nullptr; freeHandles.push_back(h); }
++    wr(o->guest, 0);
++    gfree(o->guest, 8);
++}
++
++// GL names whose owners died on a thread without the context; deleted at the next Present
++std::vector<GLuint> deadTextures, deadFbos, deadRenderbuffers;
++
++struct Tex;
++struct Surf : Obj {
++    Tex* owner = nullptr;   // texture level: refcount and pixels live in the texture
++    U32 level = 0;
++    U32 w = 0, h = 0, fmt = FMT_A8R8G8B8, pool = POOL_SYSTEMMEM, usage = 0;
++    U32 shadow = 0;         // image surfaces: guest B,G,R,A rows, pitch w*4
++    GLuint fbo = 0, color = 0, depth = 0;   // back buffer: FBO + colour renderbuffer; depth surfaces: renderbuffer
++    ~Surf() override {
++        if (fbo) deadFbos.push_back(fbo);
++        if (color) deadRenderbuffers.push_back(color);
++        if (depth) deadRenderbuffers.push_back(depth);
++        gfree(shadow, w * h * 4);
++    }
++};
++
++struct Level {
++    U32 w, h, shadow;       // guest B,G,R,A rows, pitch w*4 (0 for render targets)
++    int x0, y0, x1, y1;     // dirty rect (x1 <= x0: clean)
++    bool locked = false;
++    Surf* surf = nullptr;   // GetSurfaceLevel's object, made on first use
++};
++struct Tex : Obj {
++    U32 fmt = FMT_A8R8G8B8, pool = POOL_MANAGED, usage = 0;
++    std::vector<Level> levels;
++    GLuint tex = 0, fbo = 0, fboDepth = 0;
++    int sampler[5] = {-1, -1, -1, -1, -1};   // GL params last set: mag, min, wrap s, wrap t, max level
++    bool rt() const { return usage & USAGE_RENDERTARGET; }
++    ~Tex() override {
++        for (Level& l : levels) {
++            gfree(l.shadow, l.w * l.h * 4);
++            if (l.surf) { destroyGuest(l.surf); l.surf->owner = nullptr; delete l.surf; }
++        }
++        if (tex) deadTextures.push_back(tex);
++        if (fbo) deadFbos.push_back(fbo);
++        if (fboDepth) deadRenderbuffers.push_back(fboDepth);
++    }
++};
++
++struct D3D : Obj {};
++
++struct Matrix { float m[4][4]; };
++Matrix identity() { Matrix r{}; for (int i = 0; i < 4; i++) r.m[i][i] = 1; return r; }
++Matrix mul(const Matrix& a, const Matrix& b) {
++    Matrix r{};
++    for (int i = 0; i < 4; i++)
++        for (int j = 0; j < 4; j++)
++            for (int k = 0; k < 4; k++) r.m[i][j] += a.m[i][k] * b.m[k][j];
++    return r;
++}
++
++struct Vertex { float x, y, z; U8 c[4]; float u, v; };   // c = R,G,B,A (lit)
++
++struct Dev : Obj {
++    D3D* d3d = nullptr;
++    EMSCRIPTEN_WEBGL_CONTEXT_HANDLE ctx = 0;
++    U32 bbW = 0, bbH = 0, autoDepthFmt = 0, window = 0, behavior = 0;
++    bool hasAutoDepth = false;
++    Surf* backBuffer = nullptr;
++    Surf* autoDepth = nullptr;
++    Surf* target = nullptr;
++    Surf* depth = nullptr;
++    Tex* texture = nullptr;
++    U32 rs[256] = {};
++    U32 tss[32] = {};
++    Matrix world, view, proj;
++    U32 vp[4] = {};          // X, Y, Width, Height
++    float vpZ[2] = {0, 1};
++    float material[17] = {}; // Diffuse, Ambient, Specular, Emissive (r,g,b,a each), Power
++    U32 fvf = 0;
++    GLuint program = 0, vao = 0, vbo = 0;
++    GLint u[16] = {};
++    std::vector<Vertex> batch;
++    bool cursorShown = false;
++};
++Dev* dev;   // one device per process (the game makes exactly one)
++
++bool onGlThread() { return dev && dev->ctx && emscripten_webgl_get_current_context() == dev->ctx; }
++
++// ---------------------------------------------------------------- stats
++U32 calls[IF_COUNT][128];
++U32 frames, flushes, prims;
++double statsStart;
++bool loggedUnsupported[IF_COUNT][128];
++
++void logStats() {
++    double now = emscripten_get_now();
++    if (!statsStart) { statsStart = now; return; }
++    if (frames < 300 && now - statsStart < 20000) return;
++    double secs = (now - statsStart) / 1000.0;
++    klog_fmt("d3dnative: %.1f fps, per frame: %.1f draws in %.1f GL batches; arena %u/%u MB",
++             frames / secs, prims / (double)frames, flushes / (double)frames, (arenaTop - arenaBase) >> 20, arenaSize >> 20);
++    std::string line("d3dnative: calls/frame:");
++    for (int i = 0; i < IF_COUNT; i++)
++        for (U32 s = 0; s < kSlots[i]; s++)
++            if (calls[i][s]) {
++                char buf[96];
++                snprintf(buf, sizeof buf, " %s::%s=%.1f", kIfName[i] + 9, kMethods[i][s].name, calls[i][s] / (double)frames);
++                line += buf;
++            }
++    klog(line.c_str());
++    memset(calls, 0, sizeof calls);
++    frames = flushes = prims = 0;
++    statsStart = now;
++}
++
++// ---------------------------------------------------------------- GL
++const char* kVertexShader = R"(#version 300 es
++layout(location = 0) in vec3 aPos;
++layout(location = 1) in vec4 aColor;
++layout(location = 2) in vec2 aUV;
++uniform mat4 uViewProj;
++uniform vec2 uPixel;                  // 1 / viewport size
++out vec4 vColor;
++out vec2 vUV;
++void main() {
++    vec4 p = uViewProj * vec4(aPos, 1.0);   // raw D3D row-major upload = transposed, so this is v * V * P
++    p.x += uPixel.x * p.w;            // D3D pixel centres sit on integer coordinates, GL's on .5
++    p.y -= uPixel.y * p.w;
++    p.y = -p.y;                       // targets are stored top row first
++    p.z = 2.0 * p.z - p.w;            // D3D depth range is [0, w]
++    gl_Position = p;
++    vColor = aColor;
++    vUV = aUV;
++}
++)";
++const char* kFragmentShader = R"(#version 300 es
++precision highp float;
++precision highp int;
++in vec4 vColor;
++in vec2 vUV;
++out vec4 oColor;
++uniform sampler2D uTex;
++uniform int uHasTex, uTexBGRA, uTexOpaque;
++uniform ivec4 uColorOp, uAlphaOp;     // op, arg1, arg2, arg0
++uniform vec4 uTFactor;
++uniform int uAlphaFunc;
++uniform float uAlphaRef;
++vec4 arg(int a, vec4 tex) {
++    int s = a & 15;
++    vec4 v = s == 2 ? tex : s == 3 ? uTFactor : s == 4 ? vec4(0.0) : vColor;   // DIFFUSE and CURRENT agree on stage 0
++    if ((a & 0x20) != 0) v = vec4(v.a);
++    if ((a & 0x10) != 0) v = 1.0 - v;
++    return v;
++}
++vec4 op(ivec4 o, vec4 tex) {
++    vec4 a1 = arg(o.y, tex), a2 = arg(o.z, tex), a0 = arg(o.w, tex);
++    switch (o.x) {
++    case 2: return a1;
++    case 3: return a2;
++    case 4: return a1 * a2;
++    case 5: return 2.0 * a1 * a2;
++    case 6: return 4.0 * a1 * a2;
++    case 7: return a1 + a2;
++    case 8: return a1 + a2 - 0.5;
++    case 9: return 2.0 * (a1 + a2 - 0.5);
++    case 10: return a1 - a2;
++    case 11: return a1 + a2 - a1 * a2;
++    case 12: return mix(a2, a1, vColor.a);
++    case 13: return mix(a2, a1, tex.a);
++    case 14: return mix(a2, a1, uTFactor.a);
++    case 15: return a1 + a2 * (1.0 - tex.a);
++    case 16: return mix(a2, a1, vColor.a);
++    case 25: return a0 + a1 * a2;
++    case 26: return a0 * a1 + (1.0 - a0) * a2;
++    default: return vColor;           // DISABLE: stage 0 passes the diffuse colour through
++    }
++}
++bool passes(float a) {
++    float v = floor(a * 255.0 + 0.5);
++    switch (uAlphaFunc) {
++    case 1: return false;
++    case 2: return v < uAlphaRef;
++    case 3: return v == uAlphaRef;
++    case 4: return v <= uAlphaRef;
++    case 5: return v > uAlphaRef;
++    case 6: return v != uAlphaRef;
++    case 7: return v >= uAlphaRef;
++    default: return true;
++    }
++}
++void main() {
++    vec4 tex = vec4(1.0);             // no texture bound reads as white
++    if (uHasTex == 1) {
++        tex = texture(uTex, vUV);
++        if (uTexBGRA == 1) tex = tex.bgra;   // shadows are uploaded as stored (B,G,R,A); WebGL2 has no BGRA
++        if (uTexOpaque == 1) tex.a = 1.0;
++    }
++    vec4 c = vec4(clamp(op(uColorOp, tex).rgb, 0.0, 1.0), clamp(op(uAlphaOp, tex).a, 0.0, 1.0));
++    if (!passes(c.a)) discard;
++    oColor = c;
++}
++)";
++enum { U_VIEWPROJ, U_PIXEL, U_TEX, U_HASTEX, U_TEXBGRA, U_TEXOPAQUE, U_COLOROP, U_ALPHAOP, U_TFACTOR, U_ALPHAFUNC,
++       U_ALPHAREF, U_COUNT };
++const char* const kUniforms[U_COUNT] = {"uViewProj", "uPixel", "uTex", "uHasTex", "uTexBGRA", "uTexOpaque", "uColorOp",
++                                         "uAlphaOp", "uTFactor", "uAlphaFunc", "uAlphaRef"};
++
++GLuint compile(GLenum type, const char* src) {
++    GLuint s = glCreateShader(type);
++    glShaderSource(s, 1, &src, nullptr);
++    glCompileShader(s);
++    GLint ok = 0;
++    glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
++    if (!ok) {
++        char log[2048];
++        glGetShaderInfoLog(s, sizeof log, nullptr, log);
++        kwarn_fmt("d3dnative: shader: %s", log);
++    }
++    return s;
++}
++
++void color4(U32 c, float out[4]) {
++    out[0] = (c >> 16 & 255) / 255.f; out[1] = (c >> 8 & 255) / 255.f; out[2] = (c & 255) / 255.f; out[3] = (c >> 24) / 255.f;
++}
++GLenum glCmp(U32 f) {
++    static const GLenum t[] = {GL_ALWAYS, GL_NEVER, GL_LESS, GL_EQUAL, GL_LEQUAL, GL_GREATER, GL_NOTEQUAL, GL_GEQUAL, GL_ALWAYS};
++    return f <= 8 ? t[f] : GL_ALWAYS;
++}
++GLenum glBlend(U32 b) {
++    static const GLenum t[] = {GL_ONE, GL_ZERO, GL_ONE, GL_SRC_COLOR, GL_ONE_MINUS_SRC_COLOR, GL_SRC_ALPHA,
++                               GL_ONE_MINUS_SRC_ALPHA, GL_DST_ALPHA, GL_ONE_MINUS_DST_ALPHA, GL_DST_COLOR,
++                               GL_ONE_MINUS_DST_COLOR, GL_SRC_ALPHA_SATURATE};
++    return b <= 11 ? t[b] : GL_ONE;
++}
++GLenum glBlendOp(U32 op) {
++    static const GLenum t[] = {GL_FUNC_ADD, GL_FUNC_ADD, GL_FUNC_SUBTRACT, GL_FUNC_REVERSE_SUBTRACT, GL_MIN, GL_MAX};
++    return op <= 5 ? t[op] : GL_FUNC_ADD;
++}
++GLuint depthBuffer(U32 w, U32 h) {
++    GLuint rb;
++    glGenRenderbuffers(1, &rb);
++    glBindRenderbuffer(GL_RENDERBUFFER, rb);
++    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, w, h);
++    return rb;
++}
++
++// Creates the texture's GL object and uploads whatever the guest changed since. GL thread only.
++void syncTexture(Tex* t) {
++    if (!t->tex) {
++        glGenTextures(1, &t->tex);
++        glBindTexture(GL_TEXTURE_2D, t->tex);
++        for (U32 i = 0; i < t->levels.size(); i++)
++            glTexImage2D(GL_TEXTURE_2D, i, GL_RGBA8, t->levels[i].w, t->levels[i].h, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
++    } else {
++        glBindTexture(GL_TEXTURE_2D, t->tex);
++    }
++    static std::vector<U8> buf;
++    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
++    for (U32 i = 0; i < t->levels.size(); i++) {
++        Level& l = t->levels[i];
++        if (!l.shadow || l.locked || l.x1 <= l.x0 || l.y1 <= l.y0) continue;
++        U32 rw = l.x1 - l.x0, rh = l.y1 - l.y0;
++        buf.resize((size_t)rw * rh * 4);
++        if (rw == l.w) {
++            gcpu->memory->memcpy(buf.data(), l.shadow + l.y0 * l.w * 4, rw * rh * 4);
++        } else {
++            for (U32 y = 0; y < rh; y++)
++                gcpu->memory->memcpy(buf.data() + (size_t)y * rw * 4, l.shadow + ((l.y0 + y) * l.w + l.x0) * 4, rw * 4);
++        }
++        glTexSubImage2D(GL_TEXTURE_2D, i, l.x0, l.y0, rw, rh, GL_RGBA, GL_UNSIGNED_BYTE, buf.data());
++        l.x0 = l.y0 = l.x1 = l.y1 = 0;
++    }
++}
++
++void bindTarget() {
++    Surf* t = dev->target;
++    if (!t->owner) {   // back buffer: its colour is fixed, the depth may change
++        glBindFramebuffer(GL_FRAMEBUFFER, t->fbo);
++        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, dev->depth ? dev->depth->depth : 0);
++        return;
++    }
++    Tex* x = t->owner;
++    if (!x->tex) syncTexture(x);
++    if (!x->fbo) glGenFramebuffers(1, &x->fbo);
++    glBindFramebuffer(GL_FRAMEBUFFER, x->fbo);
++    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, x->tex, t->level);
++    GLuint rb = 0;
++    if (dev->depth && dev->depth->w == t->w && dev->depth->h == t->h) {
++        rb = dev->depth->depth;
++    } else if (dev->depth) {   // WebGL2 wants equal attachment sizes: give the texture a depth buffer of its own
++        if (!x->fboDepth) x->fboDepth = depthBuffer(t->w, t->h);
++        rb = x->fboDepth;
++    }
++    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, rb);
++}
++
++void applyState() {
++    Dev* d = dev;
++    glUseProgram(d->program);
++    bindTarget();
++    glDisable(GL_SCISSOR_TEST);
++    glViewport(d->vp[0], d->vp[1], d->vp[2], d->vp[3]);
++    glDepthRangef(d->vpZ[0], d->vpZ[1]);
++    Matrix vpm = mul(d->view, d->proj);
++    glUniformMatrix4fv(d->u[U_VIEWPROJ], 1, GL_FALSE, &vpm.m[0][0]);
++    glUniform2f(d->u[U_PIXEL], 1.f / d->vp[2], 1.f / d->vp[3]);
++    glUniform4i(d->u[U_COLOROP], d->tss[TSS_COLOROP], d->tss[TSS_COLORARG1], d->tss[TSS_COLORARG2], d->tss[TSS_COLORARG0]);
++    // D3D: with COLOROP DISABLE the alpha op is disabled too
++    glUniform4i(d->u[U_ALPHAOP], d->tss[TSS_COLOROP] == TOP_DISABLE ? TOP_DISABLE : d->tss[TSS_ALPHAOP],
++                d->tss[TSS_ALPHAARG1], d->tss[TSS_ALPHAARG2], d->tss[TSS_ALPHAARG0]);
++    float f[4];
++    color4(d->rs[RS_TEXTUREFACTOR], f);
++    glUniform4fv(d->u[U_TFACTOR], 1, f);
++    glUniform1i(d->u[U_ALPHAFUNC], d->rs[RS_ALPHATESTENABLE] ? (int)d->rs[RS_ALPHAFUNC] : (int)CMP_ALWAYS);
++    glUniform1f(d->u[U_ALPHAREF], (float)(d->rs[RS_ALPHAREF] & 255));
++    glUniform1i(d->u[U_TEX], 0);
++    Tex* t = d->texture;
++    glUniform1i(d->u[U_HASTEX], t ? 1 : 0);
++    glUniform1i(d->u[U_TEXBGRA], t && !t->rt() ? 1 : 0);
++    glUniform1i(d->u[U_TEXOPAQUE], t && t->fmt == FMT_X8R8G8B8 ? 1 : 0);
++
++    if (d->rs[RS_ZENABLE] && d->depth) {
++        glEnable(GL_DEPTH_TEST);
++        glDepthFunc(glCmp(d->rs[RS_ZFUNC]));
++        glDepthMask(d->rs[RS_ZWRITEENABLE] ? 1 : 0);
++    } else {
++        glDisable(GL_DEPTH_TEST);
++        glDepthMask(0);
++    }
++    if (d->rs[RS_ALPHABLENDENABLE]) {
++        glEnable(GL_BLEND);
++        glBlendFunc(glBlend(d->rs[RS_SRCBLEND]), glBlend(d->rs[RS_DESTBLEND]));
++        glBlendEquation(glBlendOp(d->rs[RS_BLENDOP]));
++    } else {
++        glDisable(GL_BLEND);
++    }
++    // the y flip turns D3D's on-screen clockwise into GL's counter-clockwise
++    if (d->rs[RS_CULLMODE] == CULL_NONE) {
++        glDisable(GL_CULL_FACE);
++    } else {
++        glEnable(GL_CULL_FACE);
++        glFrontFace(GL_CCW);
++        glCullFace(d->rs[RS_CULLMODE] == CULL_CCW ? GL_BACK : GL_FRONT);
++    }
++    U32 cw = d->rs[RS_COLORWRITEENABLE];
++    glColorMask(cw & 1, cw >> 1 & 1, cw >> 2 & 1, (cw >> 3 & 1) && d->target->fmt != FMT_X8R8G8B8);
++
++    glActiveTexture(GL_TEXTURE0);
++    if (!t) {
++        glBindTexture(GL_TEXTURE_2D, 0);
++        return;
++    }
++    syncTexture(t);
++    bool mip = t->levels.size() > 1 && d->tss[TSS_MIPFILTER] != TEXF_NONE;
++    auto filter = [](U32 f) { return f >= TEXF_LINEAR ? GL_LINEAR : GL_NEAREST; };
++    auto wrap = [](U32 a) { return a == TADDRESS_WRAP ? GL_REPEAT : a == TADDRESS_MIRROR ? GL_MIRRORED_REPEAT : GL_CLAMP_TO_EDGE; };
++    GLint minf = filter(d->tss[TSS_MINFILTER]);
++    if (mip) minf = d->tss[TSS_MIPFILTER] >= TEXF_LINEAR ? (minf == GL_LINEAR ? GL_LINEAR_MIPMAP_LINEAR : GL_NEAREST_MIPMAP_LINEAR)
++                                                        : (minf == GL_LINEAR ? GL_LINEAR_MIPMAP_NEAREST : GL_NEAREST_MIPMAP_NEAREST);
++    int want[5] = {(int)filter(d->tss[TSS_MAGFILTER]), minf, (int)wrap(d->tss[TSS_ADDRESSU]), (int)wrap(d->tss[TSS_ADDRESSV]),
++                   mip ? (int)t->levels.size() - 1 : 0};
++    static const GLenum names[5] = {GL_TEXTURE_MAG_FILTER, GL_TEXTURE_MIN_FILTER, GL_TEXTURE_WRAP_S, GL_TEXTURE_WRAP_T, GL_TEXTURE_MAX_LEVEL};
++    for (int i = 0; i < 5; i++)
++        if (t->sampler[i] != want[i]) glTexParameteri(GL_TEXTURE_2D, names[i], t->sampler[i] = want[i]);
++}
++
++void flush() {
++    Dev* d = dev;
++    if (!d || d->batch.empty()) return;
++    applyState();
++    glBindVertexArray(d->vao);
++    glBindBuffer(GL_ARRAY_BUFFER, d->vbo);
++    glBufferData(GL_ARRAY_BUFFER, d->batch.size() * sizeof(Vertex), d->batch.data(), GL_STREAM_DRAW);
++    glDrawArrays(GL_TRIANGLES, 0, (GLsizei)d->batch.size());
++    d->batch.clear();
++    flushes++;
++}
++
++// Every setter of state the batch depends on calls this first (world, material and lighting are baked per vertex)
++template <class T> void change(T& slot, T value) { if (slot != value) { flush(); slot = value; } }
++
++// D3D lighting without lights: rgb = emissive + ambient * D3DRS_AMBIENT, alpha from the diffuse source
++void lit(U32 vertexColor, bool hasColor, U8 out[4]) {
++    Dev* d = dev;
++    float vc[4];
++    color4(hasColor ? vertexColor : 0xffffffff, vc);
++    float r[4];
++    if (d->rs[RS_LIGHTING]) {
++        bool cv = d->rs[RS_COLORVERTEX] && hasColor;
++        auto src = [&](U32 state, int m) -> const float* { return cv && d->rs[state] == MCS_COLOR1 ? vc : &d->material[m * 4]; };
++        const float* dif = src(RS_DIFFUSEMATERIALSOURCE, 0);
++        const float* amb = src(RS_AMBIENTMATERIALSOURCE, 1);
++        const float* emi = src(RS_EMISSIVEMATERIALSOURCE, 3);
++        float ga[4];
++        color4(d->rs[RS_AMBIENT], ga);
++        for (int i = 0; i < 3; i++) r[i] = emi[i] + amb[i] * ga[i];
++        r[3] = dif[3];
++    } else {
++        memcpy(r, vc, sizeof r);
++    }
++    for (int i = 0; i < 4; i++) {
++        float v = r[i] < 0 ? 0 : r[i] > 1 ? 1 : r[i];
++        out[i] = (U8)(v * 255.f + 0.5f);
++    }
++}
++
++// ---------------------------------------------------------------- helpers for methods
++U32 writeSurfaceDesc(U32 p, U32 fmt, U32 type, U32 usage, U32 pool, U32 w, U32 h) {
++    if (!p) return D3DERR_INVALIDCALL;
++    U32 v[8] = {fmt, type, usage, pool, w * h * 4, 0, w, h};
++    for (int i = 0; i < 8; i++) wr(p + i * 4, v[i]);
++    return D3D_OK;
++}
++
++U32 lockLevel(U32 shadow, U32 w, U32 h, U32 lockedRect, U32 rectPtr, int dirty[4]) {
++    if (!lockedRect || !shadow) return D3DERR_INVALIDCALL;
++    int x0 = 0, y0 = 0, x1 = w, y1 = h;
++    if (rectPtr) { x0 = rd(rectPtr); y0 = rd(rectPtr + 4); x1 = rd(rectPtr + 8); y1 = rd(rectPtr + 12); }
++    if (x0 < 0 || y0 < 0 || x1 > (int)w || y1 > (int)h || x0 >= x1 || y0 >= y1) return D3DERR_INVALIDCALL;
++    wr(lockedRect, w * 4);
++    wr(lockedRect + 4, shadow + (y0 * w + x0) * 4);
++    dirty[0] = x0; dirty[1] = y0; dirty[2] = x1; dirty[3] = y1;
++    return D3D_OK;
++}
++
++void addDirty(Level& l, const int r[4]) {
++    if (l.x1 <= l.x0) { l.x0 = r[0]; l.y0 = r[1]; l.x1 = r[2]; l.y1 = r[3]; return; }
++    l.x0 = std::min(l.x0, r[0]); l.y0 = std::min(l.y0, r[1]); l.x1 = std::max(l.x1, r[2]); l.y1 = std::max(l.y1, r[3]);
++}
++
++U32 release(Obj* o);
++U32 addRef(Obj* o) {
++    if (o->iface == IF_SURF && ((Surf*)o)->owner) return addRef(((Surf*)o)->owner);
++    return ++o->refs;
++}
++U32 release(Obj* o) {
++    if (o->iface == IF_SURF && ((Surf*)o)->owner) return release(((Surf*)o)->owner);
++    U32 r = --o->refs;
++    if (r) return r;
++    if (o == dev) return 0;   // ponytail: the device lives until the process exits (the game releases it at exit)
++    if (dev && dev->texture == o) dev->texture = nullptr;
++    destroyGuest(o);
++    delete o;
++    return 0;
++}
++void setRef(Surf*& slot, Surf* s) {
++    if (s) addRef(s);
++    if (slot) release(slot);
++    slot = s;
++}
++
++Surf* newSurface(U32 w, U32 h, U32 fmt, U32 pool, U32 usage) {
++    Surf* s = new Surf;
++    s->w = w; s->h = h; s->fmt = fmt; s->pool = pool; s->usage = usage;
++    if (!newGuest(s, IF_SURF)) { delete s; return nullptr; }
++    return s;
++}
++
++const U32 kModes[][2] = {{640, 480}, {800, 600}, {1024, 768}, {1280, 720}, {1280, 1024}};
++const U32 kModeCount = sizeof kModes / sizeof kModes[0];
++
++void writeCaps(U32 p, U32 devType) {
++    U32 c[53] = {};
++    c[0] = devType;
++    c[2] = 0x20000;           // Caps: READ_SCANLINE
++    c[3] = 0x20000000;        // Caps2: CANRENDERWINDOWED
++    c[4] = 0x20;              // Caps3: ALPHA_FULLSCREEN_FLIP_OR_DISCARD
++    c[5] = 0x8000000F;        // PresentationIntervals: IMMEDIATE | ONE..FOUR
++    c[7] = 0x1A750;           // DevCaps: EXECUTESYSTEMMEMORY..HWTRANSFORMANDLIGHT, DRAWPRIMTLVERTEX, HWRASTERIZATION
++    c[8] = 0x2CF2;            // PrimitiveMiscCaps: CULLNONE/CW/CCW, COLORWRITEENABLE, BLENDOP, MASKZ
++    c[9] = 0x0157D191;        // RasterCaps: DITHER, ZTEST, FOGVERTEX, ...
++    c[10] = c[13] = 0xFF;     // ZCmpCaps, AlphaCmpCaps: all
++    c[11] = c[12] = 0x1FFF;   // Src/DestBlendCaps
++    c[14] = 0x00084208;       // ShadeCaps: COLORGOURAUDRGB, ALPHAGOURAUDBLEND, ...
++    c[15] = 0x0001CC45;       // TextureCaps: PERSPECTIVE, ALPHA, MIPMAP, ... (no POW2: NPOT is fine on WebGL2)
++    c[16] = 0x03030300;       // TextureFilterCaps: MIN/MAG POINT+LINEAR, MIP POINT+LINEAR
++    c[19] = 0x1F;             // TextureAddressCaps
++    c[21] = 0x1F;             // LineCaps
++    c[22] = c[23] = 4096;     // MaxTextureWidth/Height
++    c[25] = 8192; c[26] = 4096; c[27] = 1;
++    c[28] = asU32(1e10f);
++    c[29] = asU32(-32768.f); c[30] = asU32(-32768.f); c[31] = asU32(32768.f); c[32] = asU32(32768.f);
++    c[35] = 0x80008;          // FVFCaps: 8 texture coordinate sets, PSIZE
++    c[36] = 0x03FFFFFF;       // TextureOpCaps: everything, MULTIPLYADD and LERP included
++    c[37] = 8; c[38] = 8;     // MaxTextureBlendStages, MaxSimultaneousTextures
++    c[39] = 0x3B;             // VertexProcessingCaps
++    c[40] = 8; c[41] = 6;
++    c[44] = asU32(64.f);
++    c[45] = 0xFFFFF; c[46] = 0xFFFFF; c[47] = 8; c[48] = 1024;
++    for (int i = 0; i < 53; i++) wr(p + i * 4, c[i]);
++}
++
++bool supportedTextureFormat(U32 f) { return f == FMT_A8R8G8B8 || f == FMT_X8R8G8B8; }
++bool supportedDepthFormat(U32 f) { return f == FMT_D16 || f == FMT_D24S8 || f == FMT_D24X8; }
++
++U32 unsupported(int iface, U32 slot) {
++    if (!loggedUnsupported[iface][slot]) {
++        loggedUnsupported[iface][slot] = true;
++        kwarn_fmt("d3dnative: unsupported %s::%s", kIfName[iface], kMethods[iface][slot].name);
++    }
++    return D3DERR_INVALIDCALL;
++}
++
++// ---------------------------------------------------------------- per-interface methods
++U32 createDevice(CPU* cpu, D3D* d3d) {
++    U32 type = A(3), window = A(4), behavior = A(5), pp = A(6), out = A(7);
++    if (!pp || !out) return D3DERR_INVALIDCALL;
++    if (dev) { kwarn("d3dnative: a second device is not supported"); return D3DERR_NOTAVAILABLE; }
++    EMSCRIPTEN_WEBGL_CONTEXT_HANDLE ctx = emscripten_webgl_get_current_context();
++    if (!ctx) { kwarn("d3dnative: CreateDevice without a current GL context (the guest shim makes one)"); return D3DERR_NOTAVAILABLE; }
++    EmscriptenWebGLContextAttributes attrs;
++    emscripten_webgl_get_context_attributes(ctx, &attrs);
++    if (attrs.majorVersion < 2) { kwarn("d3dnative: the guest's GL context is WebGL 1; WebGL 2 needed"); return D3DERR_NOTAVAILABLE; }
++    Dev* d = new Dev;
++    d->d3d = d3d;
++    d->ctx = ctx;
++    d->bbW = rd(pp);
++    d->bbH = rd(pp + 4);
++    d->hasAutoDepth = rd(pp + 32) != 0;
++    d->autoDepthFmt = rd(pp + 36);
++    d->window = window;
++    d->behavior = behavior;
++    if (!d->bbW || !d->bbH) {   // "use the window's size"
++        int w = 0, h = 0;
++        emscripten_webgl_get_drawing_buffer_size(ctx, &w, &h);
++        d->bbW = w; d->bbH = h;
++        wr(pp, w); wr(pp + 4, h);
++    }
++    if (!newGuest(d, IF_DEV)) { delete d; return D3DERR_OUTOFVIDEOMEMORY; }
++    d3d->refs++;
++    dev = d;
++
++    GLuint vs = compile(GL_VERTEX_SHADER, kVertexShader), fs = compile(GL_FRAGMENT_SHADER, kFragmentShader);
++    d->program = glCreateProgram();
++    glAttachShader(d->program, vs);
++    glAttachShader(d->program, fs);
++    glLinkProgram(d->program);
++    glDeleteShader(vs);
++    glDeleteShader(fs);
++    for (int i = 0; i < U_COUNT; i++) d->u[i] = glGetUniformLocation(d->program, kUniforms[i]);
++    glGenVertexArrays(1, &d->vao);
++    glGenBuffers(1, &d->vbo);
++    glBindVertexArray(d->vao);
++    glBindBuffer(GL_ARRAY_BUFFER, d->vbo);
++    glEnableVertexAttribArray(0);
++    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex), (void*)offsetof(Vertex, x));
++    glEnableVertexAttribArray(1);
++    glVertexAttribPointer(1, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(Vertex), (void*)offsetof(Vertex, c));
++    glEnableVertexAttribArray(2);
++    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, sizeof(Vertex), (void*)offsetof(Vertex, u));
++
++    Surf* bb = newSurface(d->bbW, d->bbH, FMT_X8R8G8B8, POOL_DEFAULT, USAGE_RENDERTARGET);
++    glGenRenderbuffers(1, &bb->color);
++    glBindRenderbuffer(GL_RENDERBUFFER, bb->color);
++    glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, d->bbW, d->bbH);
++    glGenFramebuffers(1, &bb->fbo);
++    glBindFramebuffer(GL_FRAMEBUFFER, bb->fbo);
++    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, bb->color);
++    d->backBuffer = bb;
++    if (d->hasAutoDepth) {
++        d->autoDepth = newSurface(d->bbW, d->bbH, d->autoDepthFmt, POOL_DEFAULT, USAGE_DEPTHSTENCIL);
++        d->autoDepth->depth = depthBuffer(d->bbW, d->bbH);
++    }
++
++    // D3D8 defaults
++    U32* rs = d->rs;
++    rs[RS_ZENABLE] = d->hasAutoDepth ? 1 : 0;
++    rs[RS_FILLMODE] = 3; rs[RS_SHADEMODE] = 2; rs[RS_ZWRITEENABLE] = 1;
++    rs[RS_SRCBLEND] = BLEND_ONE; rs[RS_DESTBLEND] = BLEND_ZERO; rs[RS_CULLMODE] = CULL_CCW;
++    rs[RS_ZFUNC] = CMP_LESSEQUAL; rs[RS_ALPHAFUNC] = CMP_ALWAYS; rs[RS_TEXTUREFACTOR] = 0xffffffff;
++    rs[RS_LIGHTING] = 1; rs[RS_COLORVERTEX] = 1; rs[RS_DIFFUSEMATERIALSOURCE] = MCS_COLOR1;
++    rs[RS_SPECULARMATERIALSOURCE] = MCS_COLOR2; rs[RS_COLORWRITEENABLE] = 0xf; rs[RS_BLENDOP] = BLENDOP_ADD;
++    U32* t = d->tss;
++    t[TSS_COLOROP] = TOP_MODULATE; t[TSS_COLORARG1] = TA_TEXTURE; t[TSS_COLORARG2] = TA_CURRENT;
++    t[TSS_ALPHAOP] = TOP_SELECTARG1; t[TSS_ALPHAARG1] = TA_TEXTURE; t[TSS_ALPHAARG2] = TA_CURRENT;
++    t[TSS_COLORARG0] = t[TSS_ALPHAARG0] = TA_CURRENT;
++    t[TSS_ADDRESSU] = t[TSS_ADDRESSV] = TADDRESS_WRAP;
++    t[TSS_MAGFILTER] = t[TSS_MINFILTER] = TEXF_POINT;
++    d->world = d->view = d->proj = identity();
++    setRef(d->target, bb);
++    setRef(d->depth, d->autoDepth);
++    d->vp[2] = d->bbW; d->vp[3] = d->bbH;
++    klog_fmt("d3dnative: device %ux%u, depth %s, WebGL %d", d->bbW, d->bbH, d->hasAutoDepth ? "yes" : "no", attrs.majorVersion);
++    wr(out, d->guest);
++    return D3D_OK;
++}
++
++U32 callD3D(CPU* cpu, D3D* o, U32 slot) {
++    switch (slot) {
++    case 0: case 1: case 2: break;   // IUnknown, handled by the caller
++    case 4: return 1;                                                  // GetAdapterCount
++    case 5: {                                                          // GetAdapterIdentifier
++        U32 p = A(4);
++        if (A(2) || !p) return D3DERR_INVALIDCALL;
++        gcpu->memory->memset(p, 0, 1024 + 8 + 16 + 16 + 4);
++        const char* name = "Boxedwine native D3D8 (WebGL2)";
++        gcpu->memory->memcpy(p, "boxedwine", 10);
++        gcpu->memory->memcpy(p + 512, name, (U32)strlen(name) + 1);
++        return D3D_OK;
++    }
++    case 6: return A(2) ? 0 : kModeCount;                              // GetAdapterModeCount
++    case 7: {                                                          // EnumAdapterModes
++        U32 i = A(3), p = A(4);
++        if (A(2) || !p || i >= kModeCount) return D3DERR_INVALIDCALL;
++        wr(p, kModes[i][0]); wr(p + 4, kModes[i][1]); wr(p + 8, 60); wr(p + 12, FMT_X8R8G8B8);
++        return D3D_OK;
++    }
++    case 8: {                                                          // GetAdapterDisplayMode
++        U32 p = A(3);
++        if (A(2) || !p) return D3DERR_INVALIDCALL;
++        wr(p, 1024); wr(p + 4, 768); wr(p + 8, 60); wr(p + 12, FMT_X8R8G8B8);
++        return D3D_OK;
++    }
++    case 9: return A(4) == FMT_X8R8G8B8 ? D3D_OK : D3DERR_NOTAVAILABLE;   // CheckDeviceType
++    case 10: {                                                         // CheckDeviceFormat
++        U32 usage = A(5), fmt = A(7);
++        if (usage & USAGE_DEPTHSTENCIL) return supportedDepthFormat(fmt) ? D3D_OK : D3DERR_NOTAVAILABLE;
++        return supportedTextureFormat(fmt) ? D3D_OK : D3DERR_NOTAVAILABLE;
++    }
++    case 11: return A(6) == 0 ? D3D_OK : D3DERR_NOTAVAILABLE;          // CheckDeviceMultiSampleType: none only
++    case 12: return D3D_OK;                                            // CheckDepthStencilMatch
++    case 13: if (!A(4)) return D3DERR_INVALIDCALL; writeCaps(A(4), A(3)); return D3D_OK;   // GetDeviceCaps
++    case 14: return 0x10001;                                           // GetAdapterMonitor: any non-null handle
++    case 15: return createDevice(cpu, o);                              // CreateDevice
++    }
++    return unsupported(IF_D3D, slot);
++}
++
++Tex* createTexture(U32 w, U32 h, U32 levels, U32 usage, U32 fmt, U32 pool) {
++    Tex* t = new Tex;
++    t->fmt = fmt; t->pool = pool; t->usage = usage;
++    if (!levels) { levels = 1; for (U32 m = std::max(w, h); m > 1; m >>= 1) levels++; }
++    for (U32 i = 0; i < levels; i++) {
++        Level l{};
++        l.w = std::max(1u, w >> i); l.h = std::max(1u, h >> i);
++        if (!(usage & USAGE_RENDERTARGET)) {
++            l.shadow = galloc(l.w * l.h * 4);   // zeros = transparent black, for A8 and X8 alike
++            if (!l.shadow) { t->levels.push_back(l); delete t; return nullptr; }
++            l.x1 = l.w; l.y1 = l.h;              // the first sync defines every texel
++        }
++        t->levels.push_back(l);
++    }
++    if (!newGuest(t, IF_TEX)) { delete t; return nullptr; }
++    return t;
++}
++
++U32 present(CPU* cpu) {
++    Dev* d = dev;
++    if (!onGlThread()) { kwarn("d3dnative: Present off the GL thread"); return D3D_OK; }
++    flush();
++    int dw = 0, dh = 0;
++    emscripten_webgl_get_drawing_buffer_size(d->ctx, &dw, &dh);
++    glBindFramebuffer(GL_READ_FRAMEBUFFER, d->backBuffer->fbo);
++    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
++    glDisable(GL_SCISSOR_TEST);
++    glColorMask(1, 1, 1, 1);
++    glBlitFramebuffer(0, 0, d->bbW, d->bbH, 0, dh, dw, 0, GL_COLOR_BUFFER_BIT, dw == (int)d->bbW && dh == (int)d->bbH ? GL_NEAREST : GL_LINEAR);
++    glBindFramebuffer(GL_FRAMEBUFFER, 0);   // the guest's SwapBuffers reads the default framebuffer
++    glViewport(0, 0, dw, dh);               // and takes its size from the viewport when unsure
++    if (!deadTextures.empty()) { glDeleteTextures((GLsizei)deadTextures.size(), deadTextures.data()); deadTextures.clear(); }
++    if (!deadFbos.empty()) { glDeleteFramebuffers((GLsizei)deadFbos.size(), deadFbos.data()); deadFbos.clear(); }
++    if (!deadRenderbuffers.empty()) { glDeleteRenderbuffers((GLsizei)deadRenderbuffers.size(), deadRenderbuffers.data()); deadRenderbuffers.clear(); }
++    frames++;
++    logStats();
++    return D3D_OK;
++}
++
++U32 clear(CPU* cpu) {
++    Dev* d = dev;
++    U32 count = A(2), rects = A(3), flags = A(4), c = A(5), stencil = A(7);
++    float z;
++    U32 zb = A(6);
++    memcpy(&z, &zb, 4);
++    if (!onGlThread()) return D3DERR_INVALIDCALL;
++    flush();
++    GLbitfield mask = 0;
++    if (flags & CLEAR_TARGET) {
++        float f[4];
++        color4(c, f);
++        glClearColor(f[0], f[1], f[2], d->target->fmt == FMT_X8R8G8B8 ? 1.f : f[3]);   // X8 has no alpha: keep it 1
++        glColorMask(1, 1, 1, 1);
++        mask |= GL_COLOR_BUFFER_BIT;
++    }
++    if ((flags & CLEAR_ZBUFFER) && d->depth) { glClearDepthf(z); glDepthMask(1); mask |= GL_DEPTH_BUFFER_BIT; }
++    if ((flags & CLEAR_STENCIL) && d->depth) { glClearStencil((GLint)stencil); glStencilMask(0xff); mask |= GL_STENCIL_BUFFER_BIT; }
++    if (!mask) return D3D_OK;
++    glUseProgram(d->program);
++    bindTarget();
++    glEnable(GL_SCISSOR_TEST);   // D3D clears only the viewport (and the rects inside it)
++    for (U32 i = 0; i < (rects ? count : 1); i++) {
++        int x0 = d->vp[0], y0 = d->vp[1], x1 = d->vp[0] + d->vp[2], y1 = d->vp[1] + d->vp[3];
++        if (rects) {
++            U32 r = rects + i * 16;
++            x0 = std::max(x0, (int)rd(r)); y0 = std::max(y0, (int)rd(r + 4));
++            x1 = std::min(x1, (int)rd(r + 8)); y1 = std::min(y1, (int)rd(r + 12));
++        }
++        if (x1 <= x0 || y1 <= y0) continue;
++        glScissor(x0, y0, x1 - x0, y1 - y0);   // top-first storage: D3D rows are GL rows
++        glClear(mask);
++    }
++    glDisable(GL_SCISSOR_TEST);
++    return D3D_OK;
++}
++
++U32 drawPrimitiveUP(CPU* cpu) {
++    Dev* d = dev;
++    U32 type = A(2), count = A(3), v = A(4), stride = A(5);
++    U32 fvf = d->fvf;
++    bool hasColor = fvf & FVF_DIFFUSE;
++    U32 texCount = fvf >> 8 & 0xf;
++    U32 need = 12 + (hasColor ? 4 : 0) + (texCount ? 8 : 0);
++    if (!v || !count || (fvf & 0xe) != FVF_XYZ || stride < need || (type != 4 && type != 5 && type != 6)) {
++        if (!loggedUnsupported[IF_DEV][72]) {
++            loggedUnsupported[IF_DEV][72] = true;
++            kwarn_fmt("d3dnative: unsupported DrawPrimitiveUP type %u fvf 0x%x stride %u", type, fvf, stride);
++        }
++        return D3DERR_INVALIDCALL;
++    }
++    if (!onGlThread()) return D3DERR_INVALIDCALL;
++    U32 n = type == 4 ? count * 3 : count + 2;
++    static std::vector<U8> raw;
++    raw.resize((size_t)n * stride);
++    gcpu->memory->memcpy(raw.data(), v, n * stride);
++    static std::vector<Vertex> verts;
++    verts.resize(n);
++    const Matrix& w = d->world;
++    for (U32 i = 0; i < n; i++) {
++        const U8* p = raw.data() + (size_t)i * stride;
++        float x, y, z;
++        memcpy(&x, p, 4); memcpy(&y, p + 4, 4); memcpy(&z, p + 8, 4);
++        Vertex& o = verts[i];
++        float ww = x * w.m[0][3] + y * w.m[1][3] + z * w.m[2][3] + w.m[3][3];
++        float inv = ww != 0 && ww != 1 ? 1.f / ww : 1.f;   // ponytail: a projective world matrix divides early
++        o.x = (x * w.m[0][0] + y * w.m[1][0] + z * w.m[2][0] + w.m[3][0]) * inv;
++        o.y = (x * w.m[0][1] + y * w.m[1][1] + z * w.m[2][1] + w.m[3][1]) * inv;
++        o.z = (x * w.m[0][2] + y * w.m[1][2] + z * w.m[2][2] + w.m[3][2]) * inv;
++        U32 c = 0;
++        if (hasColor) memcpy(&c, p + 12, 4);
++        lit(c, hasColor, o.c);
++        if (texCount) { memcpy(&o.u, p + need - 8, 4); memcpy(&o.v, p + need - 4, 4); }
++        else o.u = o.v = 0;
++    }
++    std::vector<Vertex>& b = d->batch;
++    if (type == 4) {
++        b.insert(b.end(), verts.begin(), verts.end());
++    } else {
++        for (U32 i = 0; i < count; i++) {
++            if (type == 5) {   // strip: keep the winding of odd triangles
++                b.push_back(verts[i + (i & 1)]); b.push_back(verts[i + 1 - (i & 1)]); b.push_back(verts[i + 2]);
++            } else {           // fan
++                b.push_back(verts[0]); b.push_back(verts[i + 1]); b.push_back(verts[i + 2]);
++            }
++        }
++    }
++    prims++;
++    return D3D_OK;
++}
++
++U32 setTransform(CPU* cpu, bool multiply) {
++    U32 state = A(2), p = A(3);
++    if (!p) return D3DERR_INVALIDCALL;
++    Matrix m;
++    for (int i = 0; i < 16; i++) m.m[i / 4][i % 4] = rdf(p + i * 4);
++    Matrix* t = state == TS_WORLD ? &dev->world : state == TS_VIEW ? &dev->view : state == TS_PROJECTION ? &dev->proj : nullptr;
++    if (!t) return D3D_OK;   // texture transforms: accepted and ignored (TEXTURETRANSFORMFLAGS is never set)
++    if (multiply) m = mul(m, *t);
++    if (t != &dev->world && memcmp(t, &m, sizeof m)) flush();   // the world matrix is baked per vertex
++    *t = m;
++    return D3D_OK;
++}
++
++U32 getSurfaceRef(Surf* s, U32 out) {
++    if (!out) return D3DERR_INVALIDCALL;
++    wr(out, s ? s->guest : 0);
++    if (!s) return D3DERR_NOTAVAILABLE;
++    addRef(s);
++    return D3D_OK;
++}
++
++// A surface's CPU pixels: image surfaces and texture levels (guest B,G,R,A rows, pitch w*4)
++U32 shadowOf(Surf* s) { return s->owner ? s->owner->levels[s->level].shadow : s->shadow; }
++
++// CopyRects(src, rects, count, dst, points): CPU copies between surfaces with pixels in guest memory; the back buffer
++// (or a render-target texture) as the source is read back first.
++U32 copyRects(CPU* cpu) {
++    Surf* src = (Surf*)fromGuest(A(2), IF_SURF);
++    Surf* dst = (Surf*)fromGuest(A(5), IF_SURF);
++    U32 rects = A(3), count = A(4), points = A(6);
++    U32 dstBits = dst ? shadowOf(dst) : 0;
++    if (!src || !dst || !dstBits)   // both formats are 32-bit B,G,R,A(X)
++        return D3DERR_INVALIDCALL;
++    std::vector<U8> pixels((size_t)src->w * src->h * 4);
++    if (U32 bits = shadowOf(src)) {
++        gcpu->memory->memcpy(pixels.data(), bits, (U32)pixels.size());
++    } else {
++        if (!onGlThread()) return D3DERR_INVALIDCALL;
++        flush();
++        if (src->owner) { syncTexture(src->owner); if (!src->owner->fbo) glGenFramebuffers(1, &src->owner->fbo); }
++        glBindFramebuffer(GL_FRAMEBUFFER, src->owner ? src->owner->fbo : src->fbo);
++        if (src->owner) glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, src->owner->tex, src->level);
++        glPixelStorei(GL_PACK_ALIGNMENT, 4);
++        glReadPixels(0, 0, src->w, src->h, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());   // rows already top first
++        for (size_t i = 0; i < pixels.size(); i += 4) std::swap(pixels[i], pixels[i + 2]);   // to B,G,R,A
++        bindTarget();
++    }
++    U32 n = rects ? count : 1;
++    for (U32 i = 0; i < n; i++) {
++        int x0 = 0, y0 = 0, x1 = src->w, y1 = src->h;
++        if (rects) { x0 = rd(rects + i * 16); y0 = rd(rects + i * 16 + 4); x1 = rd(rects + i * 16 + 8); y1 = rd(rects + i * 16 + 12); }
++        int dx = points ? (int)rd(points + i * 8) : x0, dy = points ? (int)rd(points + i * 8 + 4) : y0;
++        if (x0 < 0 || y0 < 0 || x1 > (int)src->w || y1 > (int)src->h || x0 >= x1 || y0 >= y1 ||
++            dx < 0 || dy < 0 || dx + (x1 - x0) > (int)dst->w || dy + (y1 - y0) > (int)dst->h)
++            return D3DERR_INVALIDCALL;
++        for (int y = y0; y < y1; y++)
++            gcpu->memory->memcpy(dstBits + ((dy + y - y0) * dst->w + dx) * 4, pixels.data() + ((size_t)y * src->w + x0) * 4, (x1 - x0) * 4);
++        if (dst->owner) {
++            if (dev->texture == dst->owner && onGlThread()) flush();
++            int r[4] = {dx, dy, dx + (x1 - x0), dy + (y1 - y0)};
++            addDirty(dst->owner->levels[dst->level], r);
++        }
++    }
++    return D3D_OK;
++}
++
++U32 callDev(CPU* cpu, Dev* d, U32 slot) {
++    switch (slot) {
++    case 3: return D3D_OK;                                             // TestCooperativeLevel: a GL context is never lost
++    case 4: return 512u << 20;                                         // GetAvailableTextureMem
++    case 5: return D3D_OK;                                             // ResourceManagerDiscardBytes
++    case 6: if (!A(2)) return D3DERR_INVALIDCALL; d->d3d->refs++; wr(A(2), d->d3d->guest); return D3D_OK;   // GetDirect3D
++    case 7: if (!A(2)) return D3DERR_INVALIDCALL; writeCaps(A(2), 1); return D3D_OK;   // GetDeviceCaps
++    case 8: {                                                          // GetDisplayMode
++        U32 p = A(2);
++        if (!p) return D3DERR_INVALIDCALL;
++        wr(p, d->bbW); wr(p + 4, d->bbH); wr(p + 8, 60); wr(p + 12, FMT_X8R8G8B8);
++        return D3D_OK;
++    }
++    case 9: {                                                          // GetCreationParameters
++        U32 p = A(2);
++        if (!p) return D3DERR_INVALIDCALL;
++        wr(p, 0); wr(p + 4, 1); wr(p + 8, d->window); wr(p + 12, d->behavior);
++        return D3D_OK;
++    }
++    case 10: return D3D_OK;                                            // SetCursorProperties: the game draws its own
++    case 11: return 0;                                                 // SetCursorPosition
++    case 12: { bool was = d->cursorShown; d->cursorShown = A(2) != 0; return was; }   // ShowCursor
++    case 14: {                                                         // Reset
++        U32 pp = A(2);
++        if (!pp) return D3DERR_INVALIDCALL;
++        if (rd(pp) && rd(pp) != d->bbW) kwarn_fmt("d3dnative: Reset to %ux%u ignored (back buffer stays %ux%u)", rd(pp), rd(pp + 4), d->bbW, d->bbH);
++        flush();
++        d->vp[0] = d->vp[1] = 0; d->vp[2] = d->target->w; d->vp[3] = d->target->h;
++        return D3D_OK;
++    }
++    case 15: return present(cpu);                                      // Present (the guest shim then swaps)
++    case 16: return A(2) ? D3DERR_INVALIDCALL : getSurfaceRef(d->backBuffer, A(4));   // GetBackBuffer
++    case 17: if (!A(2)) return D3DERR_INVALIDCALL; wr(A(2), 0); wr(A(2) + 4, 0); return D3D_OK;   // GetRasterStatus
++    case 18: return 0;                                                 // SetGammaRamp
++    case 19: {                                                         // GetGammaRamp: identity
++        U32 p = A(2);
++        for (U32 c = 0; c < 3; c++)
++            for (U32 i = 0; i < 256; i++) gcpu->memory->writew(p + (c * 256 + i) * 2, (U16)(i * 257));
++        return 0;
++    }
++    case 20: {                                                         // CreateTexture
++        U32 w = A(2), h = A(3), levels = A(4), usage = A(5), fmt = A(6), pool = A(7), out = A(8);
++        if (!out || !w || !h || w > 4096 || h > 4096 || !supportedTextureFormat(fmt)) {
++            kwarn_fmt("d3dnative: CreateTexture %ux%u fmt %u usage 0x%x pool %u refused", w, h, fmt, usage, pool);
++            return D3DERR_INVALIDCALL;
++        }
++        if ((usage & USAGE_RENDERTARGET) && pool != POOL_DEFAULT) return D3DERR_INVALIDCALL;
++        Tex* t = createTexture(w, h, levels, usage, fmt, pool);
++        if (!t) return D3DERR_OUTOFVIDEOMEMORY;
++        wr(out, t->guest);
++        return D3D_OK;
++    }
++    case 26: {                                                         // CreateDepthStencilSurface
++        U32 w = A(2), h = A(3), fmt = A(4), out = A(6);
++        if (!out || !supportedDepthFormat(fmt) || !onGlThread()) return D3DERR_INVALIDCALL;
++        Surf* s = newSurface(w, h, fmt, POOL_DEFAULT, USAGE_DEPTHSTENCIL);
++        if (!s) return D3DERR_OUTOFVIDEOMEMORY;
++        s->depth = depthBuffer(w, h);
++        wr(out, s->guest);
++        return D3D_OK;
++    }
++    case 27: {                                                         // CreateImageSurface
++        U32 w = A(2), h = A(3), fmt = A(4), out = A(5);
++        if (!out || !w || !h || !supportedTextureFormat(fmt)) return D3DERR_INVALIDCALL;
++        Surf* s = newSurface(w, h, fmt, POOL_SYSTEMMEM, 0);
++        if (!s) return D3DERR_OUTOFVIDEOMEMORY;
++        s->shadow = galloc(w * h * 4);
++        if (!s->shadow) { release(s); return D3DERR_OUTOFVIDEOMEMORY; }
++        wr(out, s->guest);
++        return D3D_OK;
++    }
++    case 28: return copyRects(cpu);                                    // CopyRects
++    case 31: {                                                         // SetRenderTarget
++        Surf* rt = A(2) ? (Surf*)fromGuest(A(2), IF_SURF) : d->target;   // D3D8: NULL keeps the colour target
++        Surf* ds = A(3) ? (Surf*)fromGuest(A(3), IF_SURF) : nullptr;
++        if (!rt || !(rt->usage & USAGE_RENDERTARGET) || (A(3) && !ds)) return D3DERR_INVALIDCALL;
++        if (rt != d->target || ds != d->depth) {
++            flush();
++            setRef(d->target, rt);
++            setRef(d->depth, ds);
++        }
++        d->vp[0] = d->vp[1] = 0; d->vp[2] = rt->w; d->vp[3] = rt->h; d->vpZ[0] = 0; d->vpZ[1] = 1;   // D3D8 resets the viewport
++        return D3D_OK;
++    }
++    case 32: return getSurfaceRef(d->target, A(2));                    // GetRenderTarget
++    case 33: return getSurfaceRef(d->depth, A(2));                     // GetDepthStencilSurface
++    case 34: case 35: return D3D_OK;                                   // BeginScene, EndScene
++    case 36: return clear(cpu);                                        // Clear
++    case 37: return setTransform(cpu, false);                          // SetTransform
++    case 38: {                                                         // GetTransform
++        U32 state = A(2), p = A(3);
++        const Matrix* t = state == TS_WORLD ? &d->world : state == TS_VIEW ? &d->view : state == TS_PROJECTION ? &d->proj : nullptr;
++        if (!p) return D3DERR_INVALIDCALL;
++        Matrix id = identity();
++        if (!t) t = &id;
++        for (int i = 0; i < 16; i++) wr(p + i * 4, asU32(t->m[i / 4][i % 4]));
++        return D3D_OK;
++    }
++    case 39: return setTransform(cpu, true);                           // MultiplyTransform
++    case 40: {                                                         // SetViewport
++        U32 p = A(2);
++        if (!p) return D3DERR_INVALIDCALL;
++        U32 v[4] = {rd(p), rd(p + 4), rd(p + 8), rd(p + 12)};
++        if (v[0] + v[2] > d->target->w || v[1] + v[3] > d->target->h || !v[2] || !v[3]) return D3DERR_INVALIDCALL;
++        float z0 = rdf(p + 16), z1 = rdf(p + 20);
++        if (memcmp(v, d->vp, sizeof v) || z0 != d->vpZ[0] || z1 != d->vpZ[1]) flush();
++        memcpy(d->vp, v, sizeof v);
++        d->vpZ[0] = z0; d->vpZ[1] = z1;
++        return D3D_OK;
++    }
++    case 41: {                                                         // GetViewport
++        U32 p = A(2);
++        if (!p) return D3DERR_INVALIDCALL;
++        for (int i = 0; i < 4; i++) wr(p + i * 4, d->vp[i]);
++        wr(p + 16, asU32(d->vpZ[0])); wr(p + 20, asU32(d->vpZ[1]));
++        return D3D_OK;
++    }
++    case 42: if (!A(2)) return D3DERR_INVALIDCALL; for (int i = 0; i < 17; i++) d->material[i] = rdf(A(2) + i * 4); return D3D_OK;   // SetMaterial
++    case 43: if (!A(2)) return D3DERR_INVALIDCALL; for (int i = 0; i < 17; i++) wr(A(2) + i * 4, asU32(d->material[i])); return D3D_OK;   // GetMaterial
++    case 46: return A(3) ? unsupported(IF_DEV, slot) : D3D_OK;          // LightEnable(i, FALSE) is harmless
++    case 50: {                                                         // SetRenderState
++        U32 s = A(2), v = A(3);
++        if (s >= 256) return D3DERR_INVALIDCALL;
++        bool baked = s == RS_LIGHTING || s == RS_AMBIENT || s == RS_COLORVERTEX || (s >= RS_DIFFUSEMATERIALSOURCE && s <= RS_EMISSIVEMATERIALSOURCE);
++        if (baked) d->rs[s] = v; else change(d->rs[s], v);
++        return D3D_OK;
++    }
++    case 51: if (A(2) >= 256 || !A(3)) return D3DERR_INVALIDCALL; wr(A(3), d->rs[A(2)]); return D3D_OK;   // GetRenderState
++    case 60: {                                                         // GetTexture
++        if (!A(3)) return D3DERR_INVALIDCALL;
++        Tex* t = A(2) == 0 ? d->texture : nullptr;
++        wr(A(3), t ? t->guest : 0);
++        if (t) addRef(t);
++        return D3D_OK;
++    }
++    case 61: {                                                         // SetTexture
++        U32 stage = A(2);
++        Tex* t = A(3) ? (Tex*)fromGuest(A(3), IF_TEX) : nullptr;
++        if (A(3) && !t) return D3DERR_INVALIDCALL;
++        if (stage) return t ? unsupported(IF_DEV, slot) : D3D_OK;     // stage 1+ never textured (stage 0 only)
++        if (t == d->texture) return D3D_OK;
++        flush();
++        if (t) addRef(t);
++        Tex* old = d->texture;
++        d->texture = t;
++        if (old) release(old);
++        return D3D_OK;
++    }
++    case 62: {                                                         // GetTextureStageState
++        U32 stage = A(2), type = A(3), p = A(4);
++        if (type >= 32 || !p) return D3DERR_INVALIDCALL;
++        wr(p, stage ? (type == TSS_COLOROP || type == TSS_ALPHAOP ? TOP_DISABLE : 0) : d->tss[type]);
++        return D3D_OK;
++    }
++    case 63: {                                                         // SetTextureStageState
++        U32 stage = A(2), type = A(3), v = A(4);
++        if (type >= 32) return D3DERR_INVALIDCALL;
++        if (stage == 0) change(d->tss[type], v);
++        // ponytail: stage 1+ stays DISABLE; only stage 0 is ever enabled
++        return D3D_OK;
++    }
++    case 64: if (A(2)) wr(A(2), 1); return D3D_OK;                     // ValidateDevice
++    case 72: return drawPrimitiveUP(cpu);                              // DrawPrimitiveUP
++    case 76: {                                                         // SetVertexShader (an FVF)
++        U32 f = A(2);
++        if (f & 1) return unsupported(IF_DEV, slot);                  // a real vertex shader handle
++        d->fvf = f;
++        return D3D_OK;
++    }
++    case 77: if (!A(2)) return D3DERR_INVALIDCALL; wr(A(2), d->fvf); return D3D_OK;   // GetVertexShader
++    }
++    return unsupported(IF_DEV, slot);
++}
++
++U32 callTex(CPU* cpu, Tex* t, U32 slot) {
++    switch (slot) {
++    case 3: if (!A(2)) return D3DERR_INVALIDCALL; addRef(dev); wr(A(2), dev->guest); return D3D_OK;   // GetDevice
++    case 4: case 6: return D3D_OK;                                     // Set/FreePrivateData
++    case 5: return D3DERR_NOTAVAILABLE;                                // GetPrivateData
++    case 7: case 8: case 11: case 12: return 0;                        // Set/GetPriority, Set/GetLOD
++    case 9: return 0;                                                  // PreLoad
++    case 10: return RTYPE_TEXTURE;                                     // GetType
++    case 13: return (U32)t->levels.size();                             // GetLevelCount
++    case 14: {                                                         // GetLevelDesc
++        U32 i = A(2);
++        if (i >= t->levels.size()) return D3DERR_INVALIDCALL;
++        return writeSurfaceDesc(A(3), t->fmt, RTYPE_SURFACE, t->usage, t->pool, t->levels[i].w, t->levels[i].h);
++    }
++    case 15: {                                                         // GetSurfaceLevel
++        U32 i = A(2), out = A(3);
++        if (i >= t->levels.size() || !out) return D3DERR_INVALIDCALL;
++        Level& l = t->levels[i];
++        if (!l.surf) {
++            l.surf = newSurface(l.w, l.h, t->fmt, t->pool, t->usage);
++            if (!l.surf) return D3DERR_OUTOFVIDEOMEMORY;
++            l.surf->owner = t;
++            l.surf->level = i;
++        }
++        addRef(t);
++        wr(out, l.surf->guest);
++        return D3D_OK;
++    }
++    case 16: {                                                         // LockRect
++        U32 i = A(2), flags = A(5);
++        if (i >= t->levels.size()) return D3DERR_INVALIDCALL;
++        Level& l = t->levels[i];
++        if (l.locked) return D3DERR_INVALIDCALL;
++        if (dev && dev->texture == t && !(flags & LOCK_READONLY) && onGlThread()) flush();   // queued draws see the old texels
++        int r[4];
++        U32 hr = lockLevel(l.shadow, l.w, l.h, A(3), A(4), r);
++        if (hr) return hr;   // render targets have no shadow: not lockable, as in D3D8
++        l.locked = true;
++        if (!(flags & LOCK_READONLY)) addDirty(l, r);
++        return D3D_OK;
++    }
++    case 17: {                                                         // UnlockRect
++        U32 i = A(2);
++        if (i >= t->levels.size() || !t->levels[i].locked) return D3DERR_INVALIDCALL;
++        t->levels[i].locked = false;
++        return D3D_OK;
++    }
++    case 18: for (Level& l : t->levels) { int r[4] = {0, 0, (int)l.w, (int)l.h}; addDirty(l, r); } return D3D_OK;   // AddDirtyRect
++    }
++    return unsupported(IF_TEX, slot);
++}
++
++U32 callSurf(CPU* cpu, Surf* s, U32 slot) {
++    switch (slot) {
++    case 3: if (!A(2)) return D3DERR_INVALIDCALL; addRef(dev); wr(A(2), dev->guest); return D3D_OK;   // GetDevice
++    case 4: case 6: return D3D_OK;
++    case 5: return D3DERR_NOTAVAILABLE;
++    case 7: {                                                          // GetContainer
++        U32 out = A(3);
++        if (!out) return D3DERR_INVALIDCALL;
++        if (s->owner) { addRef(s->owner); wr(out, s->owner->guest); return D3D_OK; }
++        addRef(dev); wr(out, dev->guest); return D3D_OK;               // standalone surfaces belong to the device
++    }
++    case 8: return writeSurfaceDesc(A(2), s->fmt, RTYPE_SURFACE, s->usage, s->pool, s->w, s->h);   // GetDesc
++    case 9: {                                                          // LockRect
++        U32 flags = A(4);
++        if (s->owner) {
++            Tex* t = s->owner;
++            Level& l = t->levels[s->level];
++            if (l.locked) return D3DERR_INVALIDCALL;
++            if (dev && dev->texture == t && !(flags & LOCK_READONLY) && onGlThread()) flush();
++            int r[4];
++            U32 hr = lockLevel(l.shadow, l.w, l.h, A(2), A(3), r);
++            if (hr) return hr;
++            l.locked = true;
++            if (!(flags & LOCK_READONLY)) addDirty(l, r);
++            return D3D_OK;
++        }
++        int r[4];
++        U32 hr = lockLevel(s->shadow, s->w, s->h, A(2), A(3), r);
++        if (hr && !s->shadow) kwarn("d3dnative: LockRect on a GPU surface (back buffer/depth) is not supported");
++        return hr;
++    }
++    case 10:                                                           // UnlockRect
++        if (s->owner) s->owner->levels[s->level].locked = false;
++        return D3D_OK;
++    }
++    return unsupported(IF_SURF, slot);
++}
++
++// d3dInit(arenaBase, arenaSize, guestCreateDevice, guestPresent): writes thunks and vtables, returns an IDirect3D8*
++U32 init(CPU* cpu) {
++    if (arenaBase) { kwarn("d3dnative: Direct3DCreate8 called twice; reusing the arena"); }
++    else {
++        arenaBase = A(1); arenaSize = A(2); arenaTop = arenaBase + 0x4000;
++        U8 code[16] = {0xcd, 0x99};
++        for (int i = 0; i < IF_COUNT; i++) {
++            for (U32 s = 0; s < kSlots[i]; s++) {
++                U32 index = 0x0D3D0000 | i << 8 | s;
++                memcpy(code + 2, &index, 4);
++                code[6] = 0xc2;                    // ret imm16
++                U16 n = kMethods[i][s].argBytes;
++                memcpy(code + 7, &n, 2);
++                cpu->memory->memcpy(thunkAddr(i, s), code, 16);
++                wr(vtableAddr(i) + s * 4, thunkAddr(i, s));
++            }
++        }
++        if (A(3)) wr(vtableAddr(IF_D3D) + 15 * 4, A(3));   // the guest's CreateDevice makes the GL context first
++        if (A(4)) wr(vtableAddr(IF_DEV) + 15 * 4, A(4));   // the guest's Present swaps after ours
++        klog_fmt("d3dnative: arena 0x%08x, %u MB", arenaBase, arenaSize >> 20);
++    }
++    D3D* d = new D3D;
++    return newGuest(d, IF_D3D);
++}
++
++}  // namespace
++
++void d3dNativeCall(CPU* cpu, U32 index) {
++    std::lock_guard<std::recursive_mutex> guard(lock);
++    gcpu = cpu;
++    U32 iface = index >> 8 & 0xff, slot = index & 0xff;
++    if (iface == IF_GLOBAL) {
++        EAX = slot == 0 ? init(cpu) : 0;
++        return;
++    }
++    if (iface >= IF_COUNT || slot >= kSlots[iface]) { EAX = D3DERR_INVALIDCALL; return; }
++    calls[iface][slot]++;
++    Obj* o = fromGuest(A(1), (int)iface);
++    if (!o) {
++        kwarn_fmt("d3dnative: %s::%s on a bad object 0x%08x", kIfName[iface], kMethods[iface][slot].name, A(1));
++        EAX = D3DERR_INVALIDCALL;
++        return;
++    }
++    switch (slot) {
++    case 0: {   // QueryInterface. ponytail: every interface asked for is answered with the object itself (the D3D8
++                // base interfaces are prefixes of these vtables)
++        U32 out = A(3);
++        if (!out) { EAX = E_NOINTERFACE; return; }
++        addRef(o);
++        wr(out, o->guest);
++        EAX = D3D_OK;
++        return;
++    }
++    case 1: EAX = addRef(o); return;
++    case 2: EAX = release(o); return;
++    }
++    switch (iface) {
++    case IF_D3D: EAX = callD3D(cpu, (D3D*)o, slot); break;
++    case IF_DEV: EAX = callDev(cpu, (Dev*)o, slot); break;
++    case IF_TEX: EAX = callTex(cpu, (Tex*)o, slot); break;
++    case IF_SURF: EAX = callSurf(cpu, (Surf*)o, slot); break;
++    }
++}
++
++#else
++void d3dNativeCall(CPU* cpu, U32 index) {
++    kpanic_fmt("d3dnative: native D3D8 needs the Emscripten WebGL build (call 0x%x)", index);
++}
++#endif
+diff --git a/source/opengl/glcommon.cpp b/source/opengl/glcommon.cpp
+index dbeeb6df..492f83a1 100644
+--- a/source/opengl/glcommon.cpp
++++ b/source/opengl/glcommon.cpp
+@@ -2563,7 +2563,13 @@ static bool glCanRunOnCurrentThread(U32 index) {
+ }
+ #endif
+ 
++void d3dNativeCall(CPU* cpu, U32 index);
++
+ void callOpenGL(CPU* cpu, U32 index) {
++    if ((index & 0xffff0000) == 0x0D3D0000) {   // native Direct3D 8 (opengl/d3d8native.cpp), same int 0x99 ABI
++        d3dNativeCall(cpu, index & 0xffff);
++        return;
++    }
+ #ifdef BOXEDWINE_OPENGL
+     //KNativeWindow::getNativeWindow()->preOpenGLCall(index);
+ #ifdef __EMSCRIPTEN__
