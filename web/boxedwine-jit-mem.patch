@@ -1,0 +1,498 @@
+diff --git a/project/emscripten/boxedwine-shell.js b/project/emscripten/boxedwine-shell.js
+index 91f85a14..0b65a83c 100644
+--- a/project/emscripten/boxedwine-shell.js
++++ b/project/emscripten/boxedwine-shell.js
+@@ -2043,6 +2043,11 @@
+                     typeof Module._wasm_jit_set_record_active === 'function') {
+                 Module._wasm_jit_set_record_active();
+             }
++            // ?jithot=N: compile a block after ~200*N warm-up runs (N a power of two, default 32, 1 = stock).
++            var jitHot = getParameter("jithot");
++            if (jitHot && typeof Module._wasm_jit_set_hot_sample === 'function') {
++                Module._wasm_jit_set_hot_sample(parseInt(jitHot, 10) >>> 0);
++            }
+             if (typeof Module._wasm_jit_mt_register !== 'function') return;
+             // A fully piped zip can have zero flat blocks, so the group
+             // feeding below must not sit behind a flat-cache early return.
+diff --git a/project/emscripten/makefile b/project/emscripten/makefile
+index c96db170..71af89b3 100644
+--- a/project/emscripten/makefile
++++ b/project/emscripten/makefile
+@@ -93,7 +93,7 @@ multiThreadedJit: export EXTRA_CPP_FLAGS := -DBOXEDWINE_MULTI_THREADED -DBOXEDWI
+ multiThreadedJit: export SHELL_FILE := shell.html
+ # HEAPU8/_malloc/_free: used by boxedwine-shell.js (onRuntimeInitialized) to
+ # copy server-zip cache entries into wasm memory for _wasm_jit_mt_register.
+-multiThreadedJit: export EXTRA_LD_FLAGS := $(WASM_JIT_SIMD_FLAG) -pthread --pre-js=boxedwine-webgl-streaming.js -sPROXY_TO_PTHREAD=1 -sOFFSCREENCANVAS_SUPPORT=1 -sOFFSCREENCANVASES_TO_PTHREAD=\#canvas --pre-js=boxedwine-wasm-jit-module-broker.js --js-library=boxedwine-multithreaded-helper.js -sPTHREAD_POOL_SIZE=$(or $(PTHREAD_POOL_SIZE),32) -sALLOW_TABLE_GROWTH $(RUNTIME_MEMORY_FLAGS) -sEXPORTED_RUNTIME_METHODS=addFunction,removeFunction,wasmTable,HEAPU8,FS,IDBFS$(JIT_CCALL_EXPORTS) -sEXPORTED_FUNCTIONS=_main,_wasm_jit_mt_register,_wasm_jit_mt_register_group,_wasm_jit_mt_register_group_entry,_wasm_jit_mt_register_group_patch,_wasm_jit_mt_prepare_export,_wasm_jit_mt_set_module_broker_enabled,_wasm_jit_mt_broker_validate_module,_wasm_jit_mt_take_thread_start_owner,_wasm_jit_mt_copy_runtime_batch_stats,_wasm_jit_mt_record_group_worker_event,_wasm_jit_set_persistence_active,_wasm_jit_set_record_active,_malloc,_free
++multiThreadedJit: export EXTRA_LD_FLAGS := $(WASM_JIT_SIMD_FLAG) -pthread --pre-js=boxedwine-webgl-streaming.js -sPROXY_TO_PTHREAD=1 -sOFFSCREENCANVAS_SUPPORT=1 -sOFFSCREENCANVASES_TO_PTHREAD=\#canvas --pre-js=boxedwine-wasm-jit-module-broker.js --js-library=boxedwine-multithreaded-helper.js -sPTHREAD_POOL_SIZE=$(or $(PTHREAD_POOL_SIZE),32) -sALLOW_TABLE_GROWTH $(RUNTIME_MEMORY_FLAGS) -sEXPORTED_RUNTIME_METHODS=addFunction,removeFunction,wasmTable,HEAPU8,FS,IDBFS$(JIT_CCALL_EXPORTS) -sEXPORTED_FUNCTIONS=_main,_wasm_jit_mt_register,_wasm_jit_mt_register_group,_wasm_jit_mt_register_group_entry,_wasm_jit_mt_register_group_patch,_wasm_jit_mt_prepare_export,_wasm_jit_mt_set_module_broker_enabled,_wasm_jit_mt_broker_validate_module,_wasm_jit_mt_take_thread_start_owner,_wasm_jit_mt_copy_runtime_batch_stats,_wasm_jit_mt_record_group_worker_event,_wasm_jit_set_persistence_active,_wasm_jit_set_record_active,_wasm_jit_set_hot_sample,_malloc,_free
+ multiThreadedJit: export ASSET_FILES := boxedwine.css fsfs.js boxedwine-shell.js $(ZIP_ASSET_FILES)
+ automationMultiThreadedJit: export BUILD_DIR := Build/AutomationMultiThreadedJit
+ automationMultiThreadedJit: export EXTRA_CPP_FLAGS := -DBOXEDWINE_MULTI_THREADED -DBOXEDWINE_WASM_JIT -DBOXEDWINE_RECORDER $(WASM_JIT_SIMD_FLAG) -pthread
+diff --git a/source/emulation/cpu/common/cpu.h b/source/emulation/cpu/common/cpu.h
+index 3e772d31..27cde6cf 100644
+--- a/source/emulation/cpu/common/cpu.h
++++ b/source/emulation/cpu/common/cpu.h
+@@ -193,6 +193,15 @@ union SSE {
+ #endif
+ #endif
+ 
++// WASM JIT (multithreaded): only 1 in WASM_JIT_HOT_SAMPLE warm-up runs is counted (see firstDynamicOp).
++#ifndef WASM_JIT_HOT_SAMPLE
++#ifdef __TEST
++#define WASM_JIT_HOT_SAMPLE 1 // the CPU tests expect the stock warm-up
++#else
++#define WASM_JIT_HOT_SAMPLE 32
++#endif
++#endif
++
+ #if JIT_RUN_COUNT > 254
+ #error "JIT_RUN_COUNT must fit in DecodedOp::runCount (U8) and leave room for the JIT_RUN_COUNT + 1 sentinel"
+ #endif
+diff --git a/source/emulation/cpu/jit/jitCodeGen.cpp b/source/emulation/cpu/jit/jitCodeGen.cpp
+index 3655aaf4..fee1e762 100644
+--- a/source/emulation/cpu/jit/jitCodeGen.cpp
++++ b/source/emulation/cpu/jit/jitCodeGen.cpp
+@@ -18,6 +18,7 @@
+ 
+ #include "boxedwine.h"
+ #include <array>
++#include <bit>
+ #include <chrono>
+ 
+ #ifdef BOXEDWINE_JIT
+@@ -1180,6 +1181,23 @@ void JitCodeGen::doJIT(U32 address, DecodedOp* op) {
+     commitJIT(op);
+ }
+ 
++#if defined(BOXEDWINE_WASM_JIT) && defined(BOXEDWINE_MULTI_THREADED)
++// 1-in-(mask+1) sampling of warm-up runs; ?jithot=N on the page sets N (a power of two; 1 = stock: count every run,
++// and workers install other workers' modules on first use).
++U32 g_wasmJitHotSampleMask = WASM_JIT_HOT_SAMPLE - 1;
++extern "C" void wasm_jit_set_hot_sample(U32 n) {
++    g_wasmJitHotSampleMask = n ? std::bit_floor(n) - 1 : 0;
++}
++static inline bool wasmJitHotSample() {
++    static thread_local U32 x = 0x9e3779b9u ^ (U32)(uintptr_t)&x;
++    x ^= x << 13; x ^= x >> 17; x ^= x << 5;  // xorshift: no aliasing with loop periods, unlike a plain counter
++    return (x & g_wasmJitHotSampleMask) == 0;
++}
++bool wasmJitHotSampleExt() {
++    return wasmJitHotSample();
++}
++#endif
++
+ void OPCALL firstDynamicOp(CPU* cpu, DecodedOp* op) {
+     bool allowStartJit = true;
+ #ifdef BOXEDWINE_WASM_JIT
+@@ -1192,7 +1210,9 @@ void OPCALL firstDynamicOp(CPU* cpu, DecodedOp* op) {
+         if (liveOp != op) {
+             return;
+         }
+-        if (op->flags2 & OP_FLAG2_WASM_JIT_PENDING) {
++        // Sampled like the warm-up count: a pending block now forces its batch out after ~64*N hits instead of 64,
++        // so batches fill with more blocks (fewer, larger wasm modules; each module costs V8 a fixed overhead).
++        if ((op->flags2 & OP_FLAG2_WASM_JIT_PENDING) && wasmJitHotSample()) {
+             wasmJitHandlePendingHit(cpu, op);
+         }
+ #else
+@@ -1232,7 +1252,9 @@ void OPCALL firstDynamicOp(CPU* cpu, DecodedOp* op) {
+         op->runCount++;
+     }
+ #elif defined(BOXEDWINE_WASM_JIT)
+-    if (op->runCount != 0xff) {
++    // Count only a random 1-in-N of the warm-up runs, so a block compiles after ~JIT_RUN_COUNT*N runs instead of
++    // JIT_RUN_COUNT: one-off startup code (Wine/DLL init runs plenty of loops a few hundred times) stays interpreted.
++    if (op->runCount != 0xff && (op->runCount >= JIT_RUN_COUNT - 1 || wasmJitHotSample())) {
+         op->runCount++;
+     }
+ #else
+diff --git a/source/emulation/cpu/wasm/jitWasmCodeGen.cpp b/source/emulation/cpu/wasm/jitWasmCodeGen.cpp
+index 72fe28ad..8797794d 100644
+--- a/source/emulation/cpu/wasm/jitWasmCodeGen.cpp
++++ b/source/emulation/cpu/wasm/jitWasmCodeGen.cpp
+@@ -2267,9 +2267,12 @@ static void wasmPrepareBlockEnter(CPU* cpu, KMemoryData* memoryData) {
+     wasmJitProfileHelperBlockEnter();
+     WasmJitProfileTimer profileTimer(g_wasmJitProfileHelperBlockEnterUs);
+ #endif
++    U32* read;
++    U32* write;
++    memoryData->getWasmPageBases(read, write);
++    cpu->wasmReadPageBaseArray  = (U32)(uintptr_t)read;
++    cpu->wasmWritePageBaseArray = (U32)(uintptr_t)write;
+     cpu->wasmJitMemoryData = (U32)(uintptr_t)memoryData;
+-    cpu->wasmReadPageBaseArray  = (U32)(uintptr_t)memoryData->wasmReadPageBase;
+-    cpu->wasmWritePageBaseArray = (U32)(uintptr_t)memoryData->wasmWritePageBase;
+ }
+ 
+ // ---------------------------------------------------------------------------
+@@ -3963,17 +3966,20 @@ EM_JS(int, boxedwine_wasm_slot_check, (int tableIndex, int cpuPtr, int opPtr),
+ 
+ #ifdef BOXEDWINE_MULTI_THREADED
+ static bool lazyInstallWasmJitBlockForWorker(int tableIndex);
+-static __attribute__((noinline)) bool wasmJitPrepareSlotForWorker(int tableIndex, CPU* cpu, DecodedOp* op,
+-        std::vector<U8>& ready);
++// Slot state for this worker: READY, MISS (the install failed: the caller disables the block everywhere), or DEFER
++// (not installed here yet: run it interpreted on this worker for now).
++enum WasmJitSlotState { WASM_JIT_SLOT_MISS = 0, WASM_JIT_SLOT_READY = 1, WASM_JIT_SLOT_DEFER = 2 };
++static __attribute__((noinline)) WasmJitSlotState wasmJitPrepareSlotForWorker(int tableIndex, CPU* cpu, DecodedOp* op,
++    std::vector<U8>& ready);
+ 
+ // Keep the already-installed case small enough to inline into block dispatch.
+ // Visibility belongs to this worker, not to the shared DecodedOp. MT indices
+ // are never reused, so a verified entry needs no invalidation or generation
+ // check. Byte entries avoid the packed-bit lookup on every compiled call.
+-static inline bool wasmJitSlotReadyForWorker(int tableIndex, CPU* cpu, DecodedOp* op) {
++static inline WasmJitSlotState wasmJitSlotReadyForWorker(int tableIndex, CPU* cpu, DecodedOp* op) {
+     static thread_local std::vector<U8> ready;
+-    if (tableIndex > 0 && (size_t)tableIndex < ready.size() && ready[(size_t)tableIndex]) {
+-        return true;
++    if (tableIndex > 0 && (size_t)tableIndex < ready.size() && ready[(size_t)tableIndex] == 1) {
++        return WASM_JIT_SLOT_READY;
+     }
+     return wasmJitPrepareSlotForWorker(tableIndex, cpu, op, ready);
+ }
+@@ -4100,11 +4106,14 @@ void OPCALL wasmStartJITOp(CPU* cpu, DecodedOp* op) {
+                 // atomic publication load above is sufficient; a slot miss simply
+                 // falls back if retirement already removed lazy-install metadata.
+                 wasmJitMtLeaveCpu(cpu);
+-                if (!wasmJitSlotReadyForWorker(tableIndex, cpu, op)) {
++                WasmJitSlotState slot = wasmJitSlotReadyForWorker(tableIndex, cpu, op);
++                if (slot != WASM_JIT_SLOT_READY) {
++                    if (slot == WASM_JIT_SLOT_MISS) {
+ #ifdef BOXEDWINE_WASM_JIT_PROFILE
+-                    wasmJitProfileSlotMiss();
++                        wasmJitProfileSlotMiss();
+ #endif
+-                    disableWasmJitBlockAfterSlotMiss(op);
++                        disableWasmJitBlockAfterSlotMiss(op);
++                    }
+                     NormalCPU::getFunctionForOp(op)(cpu, op);
+                     return;
+                 }
+@@ -4124,11 +4133,14 @@ void OPCALL wasmStartJITOp(CPU* cpu, DecodedOp* op) {
+                 if (!activeCall.canCall()) {
+                     return;
+                 }
+-                if (!wasmJitSlotReadyForWorker(tableIndex, cpu, op)) {
++                WasmJitSlotState slot = wasmJitSlotReadyForWorker(tableIndex, cpu, op);
++                if (slot != WASM_JIT_SLOT_READY) {
++                    if (slot == WASM_JIT_SLOT_MISS) {
+ #ifdef BOXEDWINE_WASM_JIT_PROFILE
+-                    wasmJitProfileSlotMiss();
++                        wasmJitProfileSlotMiss();
+ #endif
+-                    disableWasmJitBlockAfterSlotMiss(op);
++                        disableWasmJitBlockAfterSlotMiss(op);
++                    }
+                     activeCall.finish(false);
+                     NormalCPU::getFunctionForOp(op)(cpu, op);
+                     return;
+@@ -5710,7 +5722,8 @@ static void flushMtRuntimeBatch(CPU* cpu, const WasmJitFlushRequest& request) {
+             WasmJitMtGroup group;
+             group.kind = WasmJitMtGroupKind::Runtime;
+             group.instanceIdentity = groupIdentity;
+-            group.bytes = std::move(merged);
++            // Runtime groups are never patched, so the per-owner state's copy is the only one kept (a second
++            // copy in group.bytes held ~270 MB by yo2.exe's title screen).
+             group.entries.reserve(entries.size());
+             for (size_t i = 0; i < entries.size(); ++i) {
+                 group.entries.push_back({0, "b" + std::to_string(i), (U32)entries[i].relocValues.size()});
+@@ -5718,7 +5731,7 @@ static void flushMtRuntimeBatch(CPU* cpu, const WasmJitFlushRequest& request) {
+             U32 groupIdx = wasmJitMtStoreRuntimeGroupLocked(std::move(group));
+ 
+             WasmJitMtGroupProcStatePtr state = std::make_shared<WasmJitMtGroupProcState>();
+-            state->patchedBytes = g_wasmMtGroups[groupIdx].bytes;
++            state->patchedBytes = std::move(merged);
+             state->entryArrays.resize(entries.size(), nullptr);
+             state->moduleRef = moduleRef;
+             for (size_t i = 0; i < entries.size(); ++i) {
+@@ -6720,19 +6733,43 @@ static inline U32 wasmJitRelocBaseForTable(int tableIndex) {
+ // Only the first call per (slot, worker) needs JS visibility checks and lazy
+ // installation. Keep that work and cache growth out of the dispatch fast path;
+ // noinline prevents LLVM from folding it back into the small readiness check.
+-static bool wasmJitPrepareSlotForWorker(int tableIndex, CPU* cpu, DecodedOp* op,
++bool wasmJitHotSampleExt();
++extern U32 g_wasmJitHotSampleMask;
++
++static WasmJitSlotState wasmJitPrepareSlotForWorker(int tableIndex, CPU* cpu, DecodedOp* op,
+         std::vector<U8>& ready) {
++    if (tableIndex <= 0) {
++        return WASM_JIT_SLOT_MISS;
++    }
++    if ((size_t)tableIndex >= ready.size()) {
++        ready.resize((size_t)tableIndex + 64, 0);
++    }
++    U8& state = ready[(size_t)tableIndex];
++    if (state == 0) {
++        if (boxedwine_wasm_slot_check(tableIndex, (int)(uintptr_t)cpu, (int)(uintptr_t)op)) {
++            state = 1;
++            return WASM_JIT_SLOT_READY;
++        }
++        state = 2;
++    }
++    // Installing a slot this worker hasn't got means compiling its whole module again here (the broker's copy only
++    // reaches a worker through its event loop, which guest threads rarely return to): ~2.3 compiles per module, and
++    // each one costs V8 the code plus its own copy of the wire bytes. So only do it once the block is as hot on this
++    // worker as the first compile required (state counts sampled runs from 2); until then it runs interpreted here.
++    if (g_wasmJitHotSampleMask && state - 2 < JIT_RUN_COUNT) {
++        if (wasmJitHotSampleExt()) {
++            state++;
++        }
++        return WASM_JIT_SLOT_DEFER;
++    }
+     if (!boxedwine_wasm_slot_check(tableIndex, (int)(uintptr_t)cpu, (int)(uintptr_t)op)) {
+         if (!lazyInstallWasmJitBlockForWorker(tableIndex) ||
+             !boxedwine_wasm_slot_check(tableIndex, (int)(uintptr_t)cpu, (int)(uintptr_t)op)) {
+-            return false;
++            return WASM_JIT_SLOT_MISS;
+         }
+     }
+-    if ((size_t)tableIndex >= ready.size()) {
+-        ready.resize((size_t)tableIndex + 64, 0);
+-    }
+-    ready[(size_t)tableIndex] = 1;
+-    return true;
++    state = 1;
++    return WASM_JIT_SLOT_READY;
+ }
+ #endif
+ 
+@@ -14675,6 +14712,41 @@ extern "C" U32 wasmJitTestEmissionCount() {
+ }
+ #endif
+ 
++#if defined(BOXEDWINE_MULTI_THREADED) && !defined(__TEST)
++#include <malloc.h>
++#include <unistd.h>
++extern int allocatedRamPages;
++extern std::atomic<int> g_kmemoryDataLive, g_wasmPageArraysLive;
++// diag: every ~5 s while blocks compile, where the JIT's C++ heap is (bytes held by each long-lived table) vs malloc in use / sbrk top.
++static void wasmJitMtMemDumpMaybe() {
++    static std::atomic<U32> last{0};
++    U32 now = (U32)(emscripten_get_now() / 1000.0);
++    U32 prev = last.load(std::memory_order_relaxed);
++    if (now < prev + 5 || !last.compare_exchange_strong(prev, now)) return;
++    U64 local = 0, hits = 0, bin = 0, binN = 0, cache = 0, cacheN = 0, grp = 0, grpN = 0, grpE = 0, proc = 0, procN = 0, relocN = 0;
++    {
++        std::lock_guard<std::mutex> lock(g_wasmBlockBinariesMutex);
++        for (auto& kv : g_wasmBlockBinaries) { bin += kv.second.capacity(); binN++; }
++        for (auto& kv : g_wasmCacheByKey) { cache += kv.second.capacity(); cacheN++; }
++        for (auto& g : g_wasmMtGroups) { grp += g.bytes.capacity(); grpE += g.entries.size(); grpN++; }
++        for (auto& kv : g_wasmMtGroupProcState) { proc += kv.second->patchedBytes.capacity(); procN++; }
++        relocN = g_wasmRelocArrays.size();
++        for (auto& kv : g_wasmJitMtBrokerStatsByOwner) { local += kv.second.localCompiles; hits += kv.second.brokerHits; }
++    }
++    U64 pend = 0, pendN = 0;
++    {
++        std::lock_guard<std::mutex> lock(g_wasmJitMtPendingMutex);
++        for (auto& kv : g_wasmJitMtPendingBlocks) { pend += kv.second->bytes.capacity(); pendN++; }
++    }
++    struct mallinfo mi = mallinfo();
++    klog_fmt("[JITMEM] t=%u sbrk=%uM inuse=%uM ram=%uM slots=%d bin=%lluM/%llu cache=%lluM/%llu groups=%lluM/%llu(%llu entries) proc=%lluM/%llu pend=%lluM/%llu relocArrays=%llu broker local=%llu hit=%llu groupInst=%llu reuse=%llu processes=%d pageArrays=%d",
++        now, (U32)((uintptr_t)sbrk(0) >> 20), (U32)(mi.uordblks >> 20), (U32)(allocatedRamPages >> 8), g_wasmTableNextSlot,
++        bin >> 20, binN, cache >> 20, cacheN, grp >> 20, grpN, grpE, proc >> 20, procN, pend >> 20, pendN, relocN, local, hits,
++        (U64)g_wasmJitMtGroupInstanceCreations.load(), (U64)g_wasmJitMtGroupInstanceReuses.load(),
++        g_kmemoryDataLive.load(), g_wasmPageArraysLive.load());
++}
++#endif
++
+ void JitWasmCodeGen::commitJIT(DecodedOp* op) {
+ #ifdef __TEST
+     g_wasmJitTestEmissionCount.fetch_add(1, std::memory_order_relaxed);
+@@ -14703,6 +14775,16 @@ void JitWasmCodeGen::commitJIT(DecodedOp* op) {
+     m_wasmBinary = m_emitter.finalize();
+ 
+     if (m_wasmBinary.empty()) return;
++#if defined(BOXEDWINE_MULTI_THREADED) && !defined(__TEST)
++    wasmJitMtMemDumpMaybe();
++#endif
++    if (m_needsWasmMemoryPageArrays) {
++        // Allocate this process's page arrays before the block is published, so block entry never has to (it can
++        // run inside a reloc-hazard window where taking memory->mutex could deadlock against an invalidation).
++        U32* read;
++        U32* write;
++        getMemData(cpu->memory)->getWasmPageBases(read, write);
++    }
+ #ifdef __TEST
+     if (std::getenv("BOXEDWINE_TEST_DUMP_WASM_MODULES")) {
+         printf("JIT_MODULE %08x %zu ", this->startingEip, m_wasmBinary.size());
+diff --git a/source/emulation/softmmu/kmemory_soft.cpp b/source/emulation/softmmu/kmemory_soft.cpp
+index 370ea830..6aefe203 100644
+--- a/source/emulation/softmmu/kmemory_soft.cpp
++++ b/source/emulation/softmmu/kmemory_soft.cpp
+@@ -26,6 +26,11 @@
+ #include "soft_code_page.h"
+ #include "devfb.h"
+ #include "soft_ram.h"
++#include <unistd.h>
++
++#ifdef BOXEDWINE_WASM_JIT
++std::atomic<int> g_kmemoryDataLive, g_wasmPageArraysLive; // diag, printed by the JIT's [JITMEM] line
++#endif
+ 
+ static InvalidPage _invalidPage;
+ static InvalidPage* invalidPage = &_invalidPage;
+@@ -84,13 +89,12 @@ KMemoryData::KMemoryData(KMemory* memory, bool enableLinearMemory, U8* adjacentL
+         linearMemoryBacking = backing;
+     }
+     ::memset(mmu, 0, sizeof(mmu));
++#ifdef BOXEDWINE_WASM_JIT
++    g_kmemoryDataLive++;
++#endif
+ #ifdef BOXEDWINE_MEM_CACHE
+     ::memset(readCache, 0, sizeof(readCache));
+     ::memset(writeCache, 0, sizeof(writeCache));
+-#endif
+-#ifdef BOXEDWINE_WASM_JIT
+-    ::memset(wasmReadPageBase,  0, sizeof(wasmReadPageBase));
+-    ::memset(wasmWritePageBase, 0, sizeof(wasmWritePageBase));
+ #endif
+     if(!callbackRam.value) {
+         callbackRam = ramPageAlloc();
+@@ -127,9 +131,104 @@ KMemoryData::~KMemoryData() {
+         ramPageReleaseLinearMemory(linearMemoryBase);
+     }
+     linearMemoryBase = nullptr;
++#ifdef BOXEDWINE_WASM_JIT
++    g_kmemoryDataLive--;
++    releaseWasmPageBases(); // before setPagesInvalid, which would write all 1M entries
++#endif
+     setPagesInvalid(0, K_NUMBER_OF_PAGES);
+ }
+ 
++#ifdef BOXEDWINE_WASM_JIT
++// The arrays are mostly 0 (unmapped guest pages), and the browser only commits the 4 KB host pages that get written.
++// So they come from fresh sbrk memory (zero, never touched: emscripten's dlmalloc never trims the break) and only
++// non-zero entries are ever written; a released pair goes to a pool with just its mapped entries zeroed again. Each
++// process then costs roughly the pages it maps instead of 8 MB (all 12 Wine processes compile some block).
++static std::mutex g_wasmPageArrayPoolMutex;
++static std::vector<U32*> g_wasmPageArrayPool;
++
++static U32* wasmPageArrayAlloc() {
++    {
++        std::lock_guard<std::mutex> lock(g_wasmPageArrayPoolMutex);
++        if (!g_wasmPageArrayPool.empty()) {
++            U32* result = g_wasmPageArrayPool.back();
++            g_wasmPageArrayPool.pop_back();
++            return result;
++        }
++    }
++    void* result = sbrk(K_NUMBER_OF_PAGES * sizeof(U32));
++    if (result == (void*)-1) {
++        kpanic("wasm jit: out of memory for page arrays");
++    }
++    return (U32*)result;
++}
++
++static inline U32 wasmPageBase(const MMU& mmu, bool canAccess) {
++    return canAccess ? (U32)(uintptr_t)ramPageGet((RamPage)mmu.ramIndex) : 0;
++}
++
++static inline void wasmPageArraySet(U32* array, std::atomic<U32>* dirty, U32 index, U32 value) {
++    // A 0 for an entry whose host page was never written is skipped without reading it: on macOS even a read
++    // commits the page, and Wine reserves and releases huge PROT_NONE ranges.
++    U32 page = index >> 10;
++    U32 bit = 1u << (page & 31);
++    if (!(dirty[page >> 5].load() & bit)) {
++        if (!value) {
++            return;
++        }
++        dirty[page >> 5].fetch_or(bit);
++    }
++    array[index] = value;
++}
++
++void KMemoryData::getWasmPageBases(U32*& read, U32*& write) {
++    read = wasmReadPageBase.load(std::memory_order_acquire);
++    write = wasmWritePageBase.load(std::memory_order_acquire);
++    if (read && write) {
++        return;
++    }
++    BOXEDWINE_CRITICAL_SECTION_WITH_MUTEX(memory->mutex);
++    read = wasmReadPageBase.load();
++    write = wasmWritePageBase.load();
++    if (read && write) {
++        return;
++    }
++    read = wasmPageArrayAlloc();
++    write = wasmPageArrayAlloc();
++    for (auto& bits : wasmReadPagesDirty) bits = 0;  // the arrays are all zero (fresh or zeroed by release)
++    for (auto& bits : wasmWritePagesDirty) bits = 0;
++    wasmReadPageBase.store(read);
++    wasmWritePageBase.store(write);
++    g_wasmPageArraysLive++;
++    // Not every onPageChanged caller holds memory->mutex. It bumps the sequence before writing the arrays, so
++    // refill until no page changed during a whole pass: then no entry can keep a value read from an older mmu.
++    U32 seq;
++    do {
++        seq = wasmPageChangeSeq.load();
++        for (U32 i = 0; i < K_NUMBER_OF_PAGES; i++) {
++            wasmPageArraySet(read, wasmReadPagesDirty, i, wasmPageBase(mmu[i], mmu[i].canReadRam));
++            wasmPageArraySet(write, wasmWritePagesDirty, i, wasmPageBase(mmu[i], mmu[i].canWriteRam));
++        }
++    } while (wasmPageChangeSeq.load() != seq);
++}
++
++void KMemoryData::releaseWasmPageBases() {
++    U32* read = wasmReadPageBase.exchange(nullptr);
++    U32* write = wasmWritePageBase.exchange(nullptr);
++    if (!read || !write) {
++        return;
++    }
++    g_wasmPageArraysLive--;
++    // Entries always mirror the current mmu, so the non-zero ones are exactly the readable/writable pages.
++    for (U32 i = 0; i < K_NUMBER_OF_PAGES; i++) {
++        if (mmu[i].canReadRam) read[i] = 0;
++        if (mmu[i].canWriteRam) write[i] = 0;
++    }
++    std::lock_guard<std::mutex> lock(g_wasmPageArrayPoolMutex);
++    g_wasmPageArrayPool.push_back(read);
++    g_wasmPageArrayPool.push_back(write);
++}
++#endif
++
+ bool KMemoryData::isPageValid(U32 page) {
+     return getPage(page) != invalidPage;
+ }
+@@ -152,10 +251,13 @@ void KMemoryData::onPageChanged(U32 index) {
+     // falls to the existing helper. ramPageGet returns a U8* into the
+     // Emscripten heap, which under wasm32 is just a 32-bit linear-mem
+     // offset; the truncation is identity.
+-    wasmReadPageBase[index]  = mmu[index].canReadRam
+-        ? (U32)(uintptr_t)ramPageGet((RamPage)mmu[index].ramIndex) : 0;
+-    wasmWritePageBase[index] = mmu[index].canWriteRam
+-        ? (U32)(uintptr_t)ramPageGet((RamPage)mmu[index].ramIndex) : 0;
++    wasmPageChangeSeq.fetch_add(1);
++    if (U32* read = wasmReadPageBase.load()) {
++        wasmPageArraySet(read, wasmReadPagesDirty, index, wasmPageBase(mmu[index], mmu[index].canReadRam));
++    }
++    if (U32* write = wasmWritePageBase.load()) {
++        wasmPageArraySet(write, wasmWritePagesDirty, index, wasmPageBase(mmu[index], mmu[index].canWriteRam));
++    }
+ #endif
+     if (linearMemoryBase && !resettingLinearMemory) {
+         U32 pageCount = ramPageLinearMemoryPageCount();
+diff --git a/source/emulation/softmmu/kmemory_soft.h b/source/emulation/softmmu/kmemory_soft.h
+index 55d59612..38b14dbb 100644
+--- a/source/emulation/softmmu/kmemory_soft.h
++++ b/source/emulation/softmmu/kmemory_soft.h
+@@ -85,8 +85,18 @@ public:
+     // skips the helper. Populated in onPageChanged() exactly the same
+     // way as readCache/writeCache above, but always with a 0 sentinel
+     // for no-access (no SIGSEGV trick — WASM can't catch it).
+-    U32 wasmReadPageBase[K_NUMBER_OF_PAGES];
+-    U32 wasmWritePageBase[K_NUMBER_OF_PAGES];
++    //
++    // Both arrays (4 MB each) are allocated when this process compiles its first block that uses them, from
++    // untouched memory, and only non-zero entries are written: a process pays for the host pages its mappings
++    // touch, not 8 MB (see getWasmPageBases).
++    std::atomic<U32*> wasmReadPageBase{nullptr};
++    std::atomic<U32*> wasmWritePageBase{nullptr};
++    std::atomic<U32> wasmPageChangeSeq{0};
++    // One bit per 4 KB host page of each array (1024 entries): set before the page's first non-zero write.
++    std::atomic<U32> wasmReadPagesDirty[K_NUMBER_OF_PAGES / 1024 / 32];
++    std::atomic<U32> wasmWritePagesDirty[K_NUMBER_OF_PAGES / 1024 / 32];
++    void getWasmPageBases(U32*& read, U32*& write);
++    void releaseWasmPageBases();
+ #endif
+     CodePage* getOrCreateCodePage(U32 address);
+ 

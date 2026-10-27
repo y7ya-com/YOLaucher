@@ -215,6 +215,72 @@ fps = presented frames.
   fixed 30 Hz and skips up to 10 renders when it falls behind (0x607fd0), so 1.2 fps means each logic step takes
   ~10× its 33 ms budget. The next lever is game-side: find the hot yo2.exe code there.
 
+### JIT memory: `boxedwine-jit-mem.patch` (2026-10-27, track stopped)
+
+`multiThreadedJit` hit our 2.5 GB page cap before the title. This patch (on top of `boxedwine-yo2.patch`) gets it
+through title → login → My Room → deck editor, and it is faster on the character list. It does not reach the
+~1.5 GB goal: the peak is 1.9 GB. The JIT track stopped here (the effort moved to static recompilation), so this is
+a record, not the shipped build.
+
+Where the JIT's C++ heap went (stock build at 31 s, page 2.5 GB, from the patch's `[JITMEM]` console line, logged
+every 5 s while blocks compile). malloc in use was 1143 MB:
+
+| item | MB |
+|---|---|
+| guest RAM | 222 |
+| merged runtime-group wasm, stored **twice** (`group.bytes` + identical `patchedBytes`) | 270 × 2 |
+| standalone / pending block bytes | ~10 |
+| everything else: decoded ops, Wine, 8 MB inline-TLB arrays per guest process (12 processes) | ~370 |
+
+30k blocks had been compiled by then, about 10 KB of wasm each. A block compiled after 200 runs, so Wine's and the
+DLLs' one-off startup code got compiled too.
+
+The patch:
+- **One copy** of each runtime group's bytes.
+- **Warm-up sampling:** `firstDynamicOp` counts a random 1-in-N run (xorshift, so loop periods can't alias it), so a
+  block compiles after ~200·N runs. Pending blocks sample their "flush the batch now" hits the same way, so batches
+  hold ~10 blocks per wasm module instead of ~2. Every module has a fixed V8 cost: 777 modules instead of 3191 at the
+  title. `&jithot=N` on the page sets N (default 32; `1` = stock behaviour).
+- **Inline-TLB arrays** (2 × 4 MB per process) come from untouched `sbrk` memory, with a dirty bit per host page, so
+  only pages the process maps get committed. A sequence counter keeps the fill race-free against `onPageChanged`
+  callers that don't hold the memory lock.
+- **No duplicate group compiles:** the module broker hands a compiled module to another worker by `postMessage`, and
+  guest threads rarely return to their event loop. So a worker touching a group compiled elsewhere compiled the whole
+  group again: ~2.3 compiles per module, each one costing V8 its code and its own copy of the wire bytes. Now the
+  worker runs that block interpreted until the block is as hot on that worker as the first compile required.
+  The last two changes (TLB dirty bits, no duplicate compiles) are built but **not measured**: the track stopped
+  before their run.
+
+Measured with `&jithot=32` (before those two), same route as the table above. fps / peak renderer MB:
+
+| screen | non-JIT (`multiThreaded`) | `multiThreadedJit` + patch | stock `multiThreadedJit` |
+|---|---|---|---|
+| title | 30.4 / 1198 | 30.2 / 1689 | killed at 2.5 GB at 31–37 s, before the title |
+| character list | 11.5 / 1299 | **23.2** / 1785 | |
+| My Room | 1.0 / 1286 | 1.5 / 1834 | |
+| deck editor | 1.2 / 1285 | 1.7 / 1910 | |
+
+`&jithot=8` reaches the title at ~31 fps with the page flat at ~2.0 GB (13.7k blocks, 139 MB of group wasm).
+`&jithot=32` gives 6.6k blocks / 70 MB at the title, ~10k blocks / 130 MB at the deck editor.
+
+Where the remaining memory is (renderer at the deck editor, `footprint`):
+
+| | non-JIT | JIT + patch |
+|---|---|---|
+| V8 tag: wasm memory + V8 heaps + compiled code | 981 MB | 1350 MB (+369) |
+| PartitionAlloc: Chrome's malloc, holding V8's per-module wasm metadata and wire-byte copies | 240 MB | 424 MB (+184) |
+
+Where the deck editor's time goes under the JIT:
+- The game thread spends ~42% in `wasmStartJITOp` itself (block-to-block dispatch through C++; runtime groups have no
+  direct calls between blocks) and only ~15–20% in generated code.
+- ~35% of JIT time is `emulateSingleOp`. It is mostly LOCK-prefixed atomics, which the JIT doesn't compile
+  (`CmpXchg`/`Xchg`/`Xadd`/`Add`/`And`/`Sub` `_Lock`: Wine's interlocked ops and critical sections), plus `int 0x80`
+  syscalls.
+- In My Room the game thread is ~40% waiting.
+
+So the next JIT levers would be: compiling LOCK ops, chaining blocks inside a group directly, and evicting cold
+groups.
+
 ### Coverage trace (debug only)
 
 `boxedwine-trace.patch` (on top of `boxedwine-yo2.patch`) records which of the game's code runs. With `&trace=1` in
