@@ -215,6 +215,15 @@ fps = presented frames.
   fixed 30 Hz and skips up to 10 renders when it falls behind (0x607fd0), so 1.2 fps means each logic step takes
   ~10× its 33 ms budget. The next lever is game-side: find the hot yo2.exe code there.
 
+### Coverage trace (debug only)
+
+`boxedwine-trace.patch` (on top of `boxedwine-yo2.patch`) records which of the game's code runs. With `&trace=1` in
+the page URL, the first decode of every basic block that starts in yo2.exe's `.text` stores the current phase number
+for that address. A block decodes once, so it costs nothing per run, and without `&trace=1` it is one byte check. In
+the page console, `bwTraceMark(n)` starts phase n (phase 1 is on from boot), and `bwTraceDump()` returns `addr:phase`
+hex pairs. Add `boxedwine-eip-sampler.patch` and `&debug=1` for hotness (`bwEip.dump()`). Mapping the addresses to
+functions needs a disassembly of the exe, which isn't in this repository.
+
 ## Play it locally
 
 `web/play.sh <client folder or yo2_2008-11_Extracted.7z>` builds everything under `$YO2WEB` (default `~/.yo2web`),

@@ -1,0 +1,69 @@
+diff --git a/project/emscripten/boxedwine-shell.js b/project/emscripten/boxedwine-shell.js
+index 91f85a14..2bba8370 100644
+--- a/project/emscripten/boxedwine-shell.js
++++ b/project/emscripten/boxedwine-shell.js
+@@ -3379,3 +3379,25 @@ async function createZip(items) {
+   end.setUint32(16, offset, true);
+   return new Blob(parts.concat(directory, [new Uint8Array(end.buffer)]), { type: "application/zip" });
+ }
++
++// Code-coverage trace (only with &trace=1): every block of yo2.exe's .text records the phase it first ran in
++// (normalCPU.cpp). bwTraceMark(n) starts phase n (1-255; phase 1 is on from boot); bwTraceDump() returns
++// "addr:phase" hex pairs for every block that ran.
++if (typeof window !== "undefined" && /[?&]trace=1(&|$)/.test(location.search)) {
++  var bwTraceHeap = function() { return Module.HEAPU8 || HEAPU8; };
++  window.bwTraceMark = function(n) { bwTraceHeap()[Module._bw_trace_phase()] = n; };
++  window.bwTraceDump = function() {
++    var map = bwTraceHeap().subarray(Module._bw_trace_map(), Module._bw_trace_map() + (0xbe5000 - 0x401000));
++    var out = [];
++    for (var i = 0; i < map.length; i++) {
++      if (map[i]) out.push((0x401000 + i).toString(16) + ":" + map[i].toString(16));
++    }
++    return out.join(",");
++  };
++  var bwTraceStart = setInterval(function() {
++    if (!Module._bw_trace_phase || !bwTraceHeap()) return;
++    clearInterval(bwTraceStart);
++    if (!bwTraceHeap()[Module._bw_trace_phase()]) window.bwTraceMark(1);
++    console.log("BWTRACE on (bwTraceMark(n), bwTraceDump())");
++  }, 200);
++}
+diff --git a/source/emulation/cpu/normal/normalCPU.cpp b/source/emulation/cpu/normal/normalCPU.cpp
+index 3881c0a2..98181f62 100644
+--- a/source/emulation/cpu/normal/normalCPU.cpp
++++ b/source/emulation/cpu/normal/normalCPU.cpp
+@@ -420,6 +420,26 @@ bool NormalCPU::isValidExecutableAddress(U32 address) {
+     return (memory->getPageFlags(address >> K_PAGE_SHIFT) & PAGE_EXEC) != 0;
+ }
+ 
++#ifdef __EMSCRIPTEN__
++#include <emscripten.h>
++// Code-coverage trace (diagnostic, only with &trace=1 in the page URL): the first decode of every block that starts in
++// yo2.exe's .text stores the page's current phase number there (0 = never ran). The page sets the phase and reads the
++// map with bwTraceMark()/bwTraceDump() (boxedwine-shell.js). A block decodes once, so this costs nothing per run.
++#define BW_TRACE_LO 0x401000
++#define BW_TRACE_HI 0xbe5000
++static U8 bwTraceMap[BW_TRACE_HI - BW_TRACE_LO];
++static volatile U8 bwTracePhase;   // 0 = trace off
++extern "C" EMSCRIPTEN_KEEPALIVE U32 bw_trace_map() { return (U32)(uintptr_t)bwTraceMap; }
++extern "C" EMSCRIPTEN_KEEPALIVE U32 bw_trace_phase() { return (U32)(uintptr_t)&bwTracePhase; }
++static void bwTraceBlock(KThread* thread, U32 eip) {
++    U8 phase = bwTracePhase;
++    if (!phase || eip < BW_TRACE_LO || eip >= BW_TRACE_HI || bwTraceMap[eip - BW_TRACE_LO]) return;
++    if (thread->process && thread->process->name.endsWith("yo2.exe", true)) bwTraceMap[eip - BW_TRACE_LO] = phase;
++}
++#else
++static void bwTraceBlock(KThread*, U32) {}
++#endif
++
+ DecodedOp* NormalCPU::getOp(U32 startIp, U32 jumpTargetFlags) {
+     if (!this->thread->process) // exit was called, don't need to pre-cache the next block
+         return nullptr;
+@@ -451,6 +471,7 @@ DecodedOp* NormalCPU::getOp(U32 startIp, U32 jumpTargetFlags) {
+                 if (!op) {
+                     return nullptr;
+                 }
++                bwTraceBlock(this->thread, startIp);
+                 DecodedOp* nextOp = op;
+ 
+                 while (nextOp) {
